@@ -18,6 +18,7 @@ import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.outlined.PushPin
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.draw.blur
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.material.icons.automirrored.filled.Reply
@@ -41,12 +42,10 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.border
 import androidx.compose.ui.zIndex
 import androidx.compose.foundation.text.BasicTextField
-import io.github.fletchmckee.liquid.rememberLiquidState
-import io.github.fletchmckee.liquid.liquefiable
-import io.github.fletchmckee.liquid.liquid
 import dev.chrisbanes.haze.HazeState
 import dev.chrisbanes.haze.haze
 import dev.chrisbanes.haze.hazeChild
+import io.github.fletchmckee.liquid.rememberLiquidState
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Send
@@ -77,6 +76,9 @@ import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.layout.LayoutCoordinates
+import androidx.compose.ui.layout.boundsInWindow
+import androidx.compose.ui.layout.onPlaced
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.TextStyle
@@ -89,6 +91,9 @@ import androidx.compose.ui.platform.LocalContext
 import com.flasskdev.vibe.data.VibeWebSocket
 import com.flasskdev.vibe.data.local.MessageEntity
 import com.flasskdev.vibe.ui.components.VibeBackgroundMesh
+import com.flasskdev.vibe.ui.components.VibeContextMenu
+import com.flasskdev.vibe.ui.components.VibeMenuAction
+import com.flasskdev.vibe.ui.components.rememberVibeMenuAnchor
 import com.flasskdev.vibe.ui.theme.*
 import com.flasskdev.vibe.ui.viewmodels.ChatScreenViewModel
 import coil.compose.AsyncImage
@@ -99,6 +104,9 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.debounce
+import kotlinx.coroutines.flow.filter
+import kotlinx.coroutines.flow.map
 import androidx.compose.runtime.produceState
 import java.text.SimpleDateFormat
 import java.util.*
@@ -121,9 +129,13 @@ import androidx.compose.ui.graphics.asImageBitmap
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import com.flasskdev.vibe.ui.theme.LocalVibeStrings
 import androidx.compose.material.icons.filled.AttachFile
 import androidx.compose.material.icons.filled.EmojiEmotions
 import androidx.compose.material.icons.filled.ContentCopy
+import androidx.compose.material.icons.outlined.CheckCircle
+import androidx.compose.material.icons.outlined.Download
+import androidx.compose.material.icons.outlined.Warning
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material.icons.filled.FormatBold
@@ -136,11 +148,47 @@ import androidx.compose.material.icons.filled.Palette
 import androidx.compose.material.icons.filled.FormatQuote
 import com.flasskdev.vibe.ui.components.FormattedText
 import com.flasskdev.vibe.utils.TextFormatting
+import com.flasskdev.vibe.ui.theme.*
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.style.TextDecoration
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 
-@OptIn(ExperimentalMaterial3Api::class)
+/*
+ * PERF-рефакторинг ChatScreen.
+ *
+ * Раньше это был один composable на ~2600 строк: чтение любого состояния (символ в поле ввода,
+ * тик рекордера, высота панели эмодзи, индекс первого видимого элемента) инвалидировало весь
+ * scope вместе с LazyColumn, поэтому пересобирались все видимые бабблы.
+ *
+ * Теперь экран собран из трёх независимых частей - ChatHeader, ChatMessageList, ChatInputBar,
+ * а изменяемое состояние живёт в @Stable-холдерах из ChatUiState.kt. Сам ChatScreen эти холдеры
+ * НЕ читает, только передаёт вниз, поэтому нажатие клавиши инвалидирует лишь ChatInputBar.
+ */
+/**
+ * PERF: SimpleDateFormat дорогой в конструкторе, а создавался он на каждое сообщение
+ * (внутри remember, но remember в баббле сбрасывается при любой смене id/времени, а сам
+ * баббл не skippable). Один инстанс на локаль, вызывается только с main thread.
+ */
+private var bubbleTimeLocale: Locale? = null
+private var bubbleTimeFormat: SimpleDateFormat? = null
+
+private fun formatBubbleTime(timestamp: Long): String {
+    val locale = Locale.getDefault()
+    val cached = bubbleTimeFormat
+    val format = if (cached != null && bubbleTimeLocale == locale) {
+        cached
+    } else {
+        SimpleDateFormat("HH:mm", locale).also {
+            bubbleTimeFormat = it
+            bubbleTimeLocale = locale
+        }
+    }
+    return format.format(Date(timestamp))
+}
+
+@OptIn(ExperimentalMaterial3Api::class, kotlinx.coroutines.FlowPreview::class)
 @Composable
 fun ChatScreen(
     interlocutorId: Int,
@@ -154,131 +202,114 @@ fun ChatScreen(
 ) {
     val context = LocalContext.current
     val db = remember { com.flasskdev.vibe.data.local.AppDatabase.getDatabase(context) }
-    val messages by viewModel.messages.collectAsState()
-    val isPartnerTyping by viewModel.isPartnerTyping.collectAsState()
+    val strings = com.flasskdev.vibe.ui.theme.LocalVibeStrings.current
+    val scope = rememberCoroutineScope()
+
+    // ViewModel и вебсокет-колбэки не видят CompositionLocal, но их тосты тоже нужно
+    // локализовать. Страховочная синхронизация; в идеале это делается в VibeTheme.
+    SideEffect { com.flasskdev.vibe.ui.theme.VibeStringsHolder.current = strings }
+
+    // ---- Стабильные холдеры состояния. ChatScreen их не читает: только раздаёт детям. ----
+    val inputState = remember(interlocutorId) { ChatInputState() }
+    val layoutState = remember(interlocutorId) { ChatLayoutState() }
+
+    /**
+     * Пункт 7: открыто ли контекстное меню какого-нибудь сообщения.
+     *
+     * Читается ТОЛЬКО внутри graphicsLayer нижней панели, то есть на фазе draw:
+     * иначе открытие меню рекомпозило бы весь экран вместе со списком сообщений.
+     */
+    val messageMenuOpen = remember(interlocutorId) { mutableStateOf(false) }
+
+    val selection = remember(interlocutorId) { ChatSelectionState() }
+    /**
+     * Выделение, созданное одним пунктом меню («Переслать» / «Удалить») ради переиспользования
+     * готовых диалогов. Если человек закрыл диалог, экран не должен остаться в режиме
+     * мультивыделения с одним сообщением: такое выделение снимается автоматически.
+     */
+    var transientSelection by remember(interlocutorId) { mutableStateOf(false) }
+
+    fun releaseTransientSelection() {
+        if (transientSelection) {
+            selection.ids.clear()
+            transientSelection = false
+        }
+    }
+
+    val toast = remember { ChatToastState() }
+
+    // PERF: один снапшот вместо messages + groupedMessages. Обе карты (byId, lazyIndex)
+    // приходят уже посчитанными из Dispatchers.Default, поэтому изменение сообщений
+    // даёт ОДИН проход рекомпозиции, а не два с промежуточным пустым списком.
+    val listSnapshot by viewModel.listSnapshot.collectAsState()
+    val messages = listSnapshot.messages
     val partnerName by viewModel.partnerName.collectAsState()
     val partnerUser by viewModel.partnerUser.collectAsState()
+    val pinnedMessages by viewModel.pinnedMessages.collectAsState()
+    val pendingInlineCallbacks by viewModel.pendingInlineCallbacks.collectAsState()
+    val highlightedMessageId by viewModel.highlightedMessageId.collectAsState()
+    val myAvatarUrl by viewModel.myAvatarUrl.collectAsState()
+
     val effectiveUser = partnerUser
     val isBlockedByMe = effectiveUser?.isBlockedByMe == true
+    val displayName = when {
+        partnerUser?.isBanned == true -> strings.accountDeleted
+        partnerUser?.isFreezed == true -> strings.accountFrozen
+        else -> partnerName.ifEmpty { interlocutorName }
+    }
 
-    val highlightedMessageId by viewModel.highlightedMessageId.collectAsState()
-    val editingMessage by viewModel.editingMessage.collectAsState()
+    val pinnedIds = remember(pinnedMessages) { pinnedMessages.mapTo(HashSet()) { it.id } }
+    // PERF: плейлист заворачивается в @Immutable data class. Раньше сюда уезжал новый
+    // экземпляр List на каждое изменение списка сообщений: нестабильный параметр делал
+    // MessageBubble принципиально не-skippable, то есть все видимые бабблы пересобирались.
+    // Теперь equals сравнивает содержимое и Compose пропускает рекомпозицию.
+    val audioFallbackTitle = strings.typeAudio
+    val chatMusicPlaylist by produceState(
+        ChatAudioPlaylist.Empty, messages, myAvatarUrl, partnerUser?.avatarUrl
+    ) {
+        value = withContext(Dispatchers.Default) {
+            ChatAudioPlaylist(
+                buildChatAudioPlaylist(messages, myAvatarUrl, partnerUser?.avatarUrl, viewModel.myUserId, audioFallbackTitle)
+            )
+        }
+    }
 
-    val isSearchActive by viewModel.isSearchActive.collectAsState()
-    val searchQuery by viewModel.searchQuery.collectAsState()
-    val searchResults by viewModel.searchResults.collectAsState()
-    val currentSearchIndex by viewModel.currentSearchIndex.collectAsState()
+    val listState = rememberLazyListState()
+    val hazeState = remember { HazeState() }
+    val liquidState = rememberLiquidState()
+
+    // ---- Диалоги и оверлеи: живут здесь, потому что перекрывают весь экран. ----
     var showDatePicker by remember { mutableStateOf(false) }
-
-        val pinnedMessages by viewModel.pinnedMessages.collectAsState()
-    val currentPinnedIndex by viewModel.currentPinnedIndex.collectAsState()
-    val pendingInlineCallbacks by viewModel.pendingInlineCallbacks.collectAsState()
-
-    var showPinnedMessagesModal by remember { mutableStateOf(false) }
-    val pinnedSheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
-    var showUnpinAllDialog by remember { mutableStateOf(false) }
-    var unpinForBoth by remember { mutableStateOf(false) }
-    
-    var messageToPin by remember { mutableStateOf<MessageEntity?>(null) }
-    var messageToUnpin by remember { mutableStateOf<MessageEntity?>(null) }
-    var botAlertText by remember { mutableStateOf<String?>(null) }
-
-    var inputTextFieldValue by remember { mutableStateOf(TextFieldValue("")) }
-        var pendingPhotos by remember { mutableStateOf<List<android.net.Uri>>(emptyList()) }
-    var pendingFiles by remember { mutableStateOf<List<android.net.Uri>>(emptyList()) }
-    var pendingVideoCoverPaths by remember { mutableStateOf<Map<String, String>>(emptyMap()) }
-
-    var viewingMessage by remember { mutableStateOf<MessageEntity?>(null) }
-    var viewingPhotoIndex by remember { mutableIntStateOf(0) }
-    var initialDraftLoaded by remember { mutableStateOf(false) }
-
-    val photoPickerLauncher = androidx.activity.compose.rememberLauncherForActivityResult(
-        contract = androidx.activity.result.contract.ActivityResultContracts.PickMultipleVisualMedia(10)
-    ) { uris ->
-        if (uris.isNotEmpty()) {
-            pendingPhotos = uris
-        }
-    }
-
-        LaunchedEffect(pendingPhotos) {
-        pendingVideoCoverPaths = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-            pendingPhotos.mapNotNull { uri ->
-                val isVideo = context.contentResolver.getType(uri).orEmpty().startsWith("video/") ||
-                    com.flasskdev.vibe.utils.AttachmentUtils.isPlayableVideo(uri.toString())
-                if (isVideo) {
-                    com.flasskdev.vibe.utils.VideoCoverGenerator.create(context, uri)
-                        ?.absolutePath
-                        ?.let { coverPath -> uri.toString() to coverPath }
-                } else {
-                    null
-                }
-            }.toMap()
-        }
-    }
-
-    val documentPickerLauncher = androidx.activity.compose.rememberLauncherForActivityResult(
-
-        contract = androidx.activity.result.contract.ActivityResultContracts.OpenMultipleDocuments()
-    ) { uris ->
-        if (uris.isNotEmpty()) {
-            pendingFiles = uris
-        }
-    }
-
-    LaunchedEffect(interlocutorId) {
-        val chat = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-            db.chatDao().getChatById(interlocutorId)
-        }
-        if (chat?.draft != null && inputTextFieldValue.text.isEmpty() && editingMessage == null) {
-            inputTextFieldValue = TextFieldValue(chat.draft)
-        }
-        initialDraftLoaded = true
-    }
-
-    LaunchedEffect(inputTextFieldValue.text) {
-        if (initialDraftLoaded && editingMessage == null) {
-            kotlinx.coroutines.delay(300)
-            db.chatDao().saveDraft(interlocutorId, inputTextFieldValue.text.ifBlank { null })
-        }
-    }
-
-    val selectedMessages = remember { mutableStateListOf<Int>() }
     var showDeleteDialog by remember { mutableStateOf(false) }
     var showForwardSheet by remember { mutableStateOf(false) }
     val forwardSheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
-    val liquidState = rememberLiquidState()
-    val hazeState = remember { HazeState() }
-    
-    var isActionMenuExpanded by remember { mutableStateOf(false) }
-    var showAttachmentMenu by remember { mutableStateOf(false) }
-    var showEmojiPanel by remember { mutableStateOf(false) }
-    var showFormattingBar by remember { mutableStateOf(false) }
-    var showPreviewMode by remember { mutableStateOf(false) }
-    var showLinkInputDialog by remember { mutableStateOf(false) }
-    var linkInputSelection by remember { mutableStateOf(androidx.compose.ui.text.TextRange.Zero) }
-    var linkInputInitialText by remember { mutableStateOf("") }
-    var showColorInputDialog by remember { mutableStateOf(false) }
-    var colorInputSelection by remember { mutableStateOf(androidx.compose.ui.text.TextRange.Zero) }
-    var colorInputInitialText by remember { mutableStateOf("") }
-    
+    var showUnpinAllDialog by remember { mutableStateOf(false) }
+    var showPinnedMessagesModal by remember { mutableStateOf(false) }
+    var unpinForBoth by remember { mutableStateOf(false) }
+    var messageToPin by remember { mutableStateOf<MessageEntity?>(null) }
+    var messageToUnpin by remember { mutableStateOf<MessageEntity?>(null) }
+    var reportMessage by remember { mutableStateOf<MessageEntity?>(null) }
+    var viewingMessage by remember { mutableStateOf<MessageEntity?>(null) }
+    var viewingPhotoIndex by remember { mutableIntStateOf(0) }
+    var botAlertText by remember { mutableStateOf<String?>(null) }
     var spamblockErrorMsg by remember { mutableStateOf<String?>(null) }
     var waitingForSpamInfo by remember { mutableStateOf(false) }
-    var toastMessage by remember { mutableStateOf("") }
-    var toastTrigger by remember { androidx.compose.runtime.mutableLongStateOf(0L) }
-    var showToast by remember { mutableStateOf(false) }
 
-    LaunchedEffect(toastTrigger) {
-        if (toastTrigger > 0L) {
-            showToast = true
-            kotlinx.coroutines.delay(2500)
-            showToast = false
+    // Черновик. Текст читается через snapshotFlow, а не в композиции, иначе ChatScreen снова
+    // подписался бы на каждое нажатие клавиши.
+    LaunchedEffect(interlocutorId) {
+        val chat = withContext(Dispatchers.IO) { db.chatDao().getChatById(interlocutorId) }
+        val draft = chat?.draft
+        if (draft != null && inputState.value.text.isEmpty() && viewModel.editingMessage.value == null) {
+            inputState.value = TextFieldValue(draft)
         }
-    }
-    val triggerToast: (String) -> Unit = remember {
-        { msg: String ->
-            toastMessage = msg
-            toastTrigger = System.currentTimeMillis()
-        }
+        snapshotFlow { inputState.value.text }
+            .debounce(300)
+            .collect { text ->
+                if (viewModel.editingMessage.value == null) {
+                    db.chatDao().saveDraft(interlocutorId, text.ifBlank { null })
+                }
+            }
     }
 
     LaunchedEffect(Unit) {
@@ -288,45 +319,23 @@ fun ChatScreen(
     }
     LaunchedEffect(Unit) {
         viewModel.botCallbackToast.collect { text ->
-            triggerToast(text)
+            toast.show(text)
         }
     }
-    
-    var reportMessage by remember { mutableStateOf<MessageEntity?>(null) }
-    
-    val recorderHelper = remember { com.flasskdev.vibe.utils.AudioRecorderHelper(context) }
-    
-    val recordAudioPermissionLauncher = androidx.activity.compose.rememberLauncherForActivityResult(
-        contract = androidx.activity.result.contract.ActivityResultContracts.RequestPermission()
-    ) { isGranted ->
-        if (!isGranted) {
-            triggerToast("Разрешение на микрофон необходимо для записи")
-        }
-    }
-    val isRecording by recorderHelper.isRecording.collectAsState()
-    val recordingDuration by recorderHelper.recordingDuration.collectAsState()
-    val audioPlayer = LocalGlobalAudioPlayer.current
-    val currentPlayingTrack by audioPlayer.currentTrack.collectAsState()
-    val isPlayingAudio by audioPlayer.isPlaying.collectAsState()
-    val audioProgress by audioPlayer.progress.collectAsState()
-    
-    val scope = rememberCoroutineScope()
-    
+
     DisposableEffect(webSocket) {
         val listener = object : com.flasskdev.vibe.data.VibeWebSocketListener {
             override fun onReportError(error: String) {
-                scope.launch { triggerToast(error) }
+                toast.show(error)
             }
             override fun onReportSuccess(messageId: Int) {
-                scope.launch { triggerToast("Жалоба успешно отправлена") }
+                toast.show(strings.reportSentToast)
             }
             override fun onSendMessageError(error: String, message: String) {
                 if (error == "spamblock_active") {
                     spamblockErrorMsg = message
                 } else {
-                    scope.launch {
-                        triggerToast(message)
-                    }
+                    toast.show(message)
                 }
             }
             override fun onUsersSearchResult(usersList: List<com.flasskdev.vibe.data.UserSearchResult>) {
@@ -335,7 +344,6 @@ fun ChatScreen(
                     if (spamBot != null) {
                         waitingForSpamInfo = false
                         spamblockErrorMsg = null
-                        // Navigate to chat
                         onNavigateToSpamInfo(spamBot.id)
                     }
                 }
@@ -343,46 +351,6 @@ fun ChatScreen(
         }
         webSocket.addListener(listener)
         onDispose { webSocket.removeListener(listener) }
-    }
-    
-    LaunchedEffect(editingMessage) {
-        if (editingMessage != null) {
-            inputTextFieldValue = TextFieldValue(editingMessage!!.content, TextRange(editingMessage!!.content.length))
-        }
-    }
-    val listState = rememberLazyListState()
-    val keyboardController = androidx.compose.ui.platform.LocalSoftwareKeyboardController.current
-    val strings = com.flasskdev.vibe.ui.theme.LocalVibeStrings.current
-    val displayName = when {
-        partnerUser?.isBanned == true -> strings.accountDeleted
-        partnerUser?.isFreezed == true -> strings.accountFrozen
-        else -> partnerName.ifEmpty { interlocutorName }
-    }
-
-    val groupedMessages by viewModel.groupedMessages.collectAsState()
-    // Build indices from the same snapshot used by LazyColumn. This avoids a stale asynchronous
-    // index map when a reply or pin jump replaces the message window.
-    val messageLazyIndex = remember(groupedMessages) {
-        buildMap {
-            var lazyIndex = 0
-            groupedMessages.forEach { (_, messagesInDay) ->
-                messagesInDay.forEach { message ->
-                    put(message.id, lazyIndex++)
-                }
-                lazyIndex++ // Date separator for the group.
-            }
-        }
-    }
-    val myAvatarUrl by viewModel.myAvatarUrl.collectAsState()
-
-    val chatMusicPlaylist by produceState<List<AudioTrackInfo>>(emptyList(), messages, myAvatarUrl, partnerUser?.avatarUrl) {
-        value = withContext(Dispatchers.Default) {
-            buildChatAudioPlaylist(messages, myAvatarUrl, partnerUser?.avatarUrl, viewModel.myUserId)
-        }
-    }
-
-    val messagesById = remember(messages) {
-        messages.associateBy { it.id }
     }
 
     LaunchedEffect(interlocutorId) {
@@ -411,11 +379,12 @@ fun ChatScreen(
     }
 
     androidx.activity.compose.BackHandler {
-        if (showEmojiPanel) {
-            showEmojiPanel = false
-        } else if (selectedMessages.isNotEmpty()) {
-            selectedMessages.clear()
-        } else if (isSearchActive) {
+        // Читаем состояние в момент нажатия, а не в композиции.
+        if (inputState.showEmojiPanel) {
+            inputState.showEmojiPanel = false
+        } else if (selection.ids.isNotEmpty()) {
+            selection.ids.clear()
+        } else if (viewModel.isSearchActive.value) {
             viewModel.closeSearch()
         } else {
             onBack()
@@ -424,15 +393,20 @@ fun ChatScreen(
 
     var previousLastMessageId by remember { mutableStateOf<Int?>(null) }
     var previousMessageCount by remember { mutableIntStateOf(0) }
-    var newMessagesCount by remember { mutableIntStateOf(0) }
 
-    LaunchedEffect(listState.firstVisibleItemIndex) {
-        if (listState.firstVisibleItemIndex == 0) {
-            newMessagesCount = 0
-        }
+    // PERF: было LaunchedEffect(listState.firstVisibleItemIndex) - чтение индекса в композиции,
+    // то есть рекомпозиция всего ChatScreen на каждый проскролленный элемент.
+    LaunchedEffect(listState) {
+        snapshotFlow { listState.firstVisibleItemIndex }
+            .distinctUntilChanged()
+            .collect { index ->
+                if (index == 0) layoutState.newMessagesCount = 0
+            }
     }
 
-    LaunchedEffect(messages) {
+    // PERF: ключом был весь список, поэтому эффект перезапускался на каждую эмиссию Room,
+    // даже когда содержимое не менялось.
+    LaunchedEffect(messages.size, messages.lastOrNull()?.id) {
         val lastMsg = messages.lastOrNull()
         if (messages.size > 0 && previousMessageCount > 0) {
             if (messages.size < previousMessageCount) {
@@ -445,7 +419,7 @@ fun ChatScreen(
                 if (isMyMessage || listState.firstVisibleItemIndex <= 1) {
                     listState.animateScrollToItem(0)
                 } else {
-                    newMessagesCount += added
+                    layoutState.newMessagesCount += added
                 }
             }
         }
@@ -453,25 +427,37 @@ fun ChatScreen(
         previousLastMessageId = lastMsg?.id
     }
 
-    // Подгрузка старых сообщений при скролле вверх (в reverseLayout это конец списка)
+    // Подгрузка старых сообщений при скролле вверх (в reverseLayout это конец списка).
+    //
+    // PERF: раньше условие проверялось на КАЖДОЕ изменение layoutInfo и срабатывало сразу
+    // при входе в чат, если вся первая страница влезала на экран (короткие сообщения). В
+    // паре с безусловным ростом _messageLimit это давало каскад догрузок и многосекундный
+    // фриз. Теперь:
+    //  - canScrollForward: если контент вообще не скроллится, догружать нечего;
+    //  - distinctUntilChanged по булеву флагу: один вызов на один вход в зону триггера.
     LaunchedEffect(listState) {
-        snapshotFlow { 
+        snapshotFlow {
             val layoutInfo = listState.layoutInfo
             val total = layoutInfo.totalItemsCount
             val lastVisible = layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: 0
-            Pair(lastVisible, total)
+            Triple(lastVisible, total, listState.canScrollForward)
         }
-        .distinctUntilChanged()
-        .collect { (lastVisible, total) ->
-            if (total > 0 && total - lastVisible <= 5 && messages.size >= 15) {
+            .map { (lastVisible, total, canScroll) ->
+                total > 0 && canScroll && total - lastVisible <= 5
+            }
+            .distinctUntilChanged()
+            .filter { it }
+            .collect {
                 viewModel.loadMoreMessages()
             }
-        }
     }
 
     LaunchedEffect(listState) {
         snapshotFlow { listState.layoutInfo.visibleItemsInfo.mapNotNull { it.key as? Int } }
             .distinctUntilChanged()
+            // PERF: во время скролла этот блок выполнялся почти каждый кадр и грузил main thread
+            // (updateCurrentPinnedIndex + onMessagesVisible + markRead по вебсокету).
+            .debounce(120)
             .collect { visibleKeys ->
                 if (visibleKeys.isNotEmpty()) {
                     viewModel.updateCurrentPinnedIndex(visibleKeys)
@@ -482,1590 +468,157 @@ fun ChatScreen(
 
     Box(modifier = Modifier.fillMaxSize().background(androidx.compose.material3.MaterialTheme.colorScheme.background)) {
 
-        // The chat list is composed later in this Box. Keep the complete chrome layer above it
-        // both visually and in Compose hit testing.
-        Box(modifier = Modifier.fillMaxSize().imePadding().zIndex(20f)) {
+        // Слой хрома над списком - и визуально, и в hit testing Compose.
+        // PERF: imePadding() ЗДЕСЬ был главной причиной лагов при появлении клавиатуры.
+        // Он менял размер контейнера каждый кадр анимации ime, а значит LazyColumn заново
+        // измерял и раскладывал все видимые бабблы (с перерасчётом текста), плюс haze
+        // перерисовывал и блюрил слой. Пустой чат этого не замечал - измерять нечего.
+        // Теперь ime-инсет применяют только те части, которым он реально нужен.
+        var isAttachMenuOpen by remember { mutableStateOf(false) }
+        var isHeaderMenuOpen by remember { mutableStateOf(false) }
 
-                        // This Column and the full-screen message container are direct children of the same Box.
-            // Its zIndex must therefore be set here (not only on descendants) for both rendering and taps.
-            Column(
+        val headerBlur by animateDpAsState(
+            targetValue = if (messageMenuOpen.value || isAttachMenuOpen) 18.dp else 0.dp,
+            animationSpec = tween(180),
+            label = "headerBlur"
+        )
+        val messageListBlur by animateDpAsState(
+            targetValue = if (isAttachMenuOpen || isHeaderMenuOpen) 18.dp else 0.dp,
+            animationSpec = tween(180),
+            label = "messageListBlur"
+        )
+        val inputBarBlur by animateDpAsState(
+            targetValue = if (isHeaderMenuOpen) 18.dp else 0.dp,
+            animationSpec = tween(180),
+            label = "inputBarBlur"
+        )
+
+        Box(modifier = Modifier.fillMaxSize().zIndex(20f)) {
+
+            ChatHeader(
                 modifier = Modifier
                     .align(Alignment.TopCenter)
                     .zIndex(10f)
-                    .statusBarsPadding()
-                    .fillMaxWidth()
-            ) {
+                    .blur(headerBlur),
+                viewModel = viewModel,
+                strings = strings,
+                hazeState = hazeState,
+                liquidState = liquidState,
+                interlocutorId = interlocutorId,
+                displayName = displayName,
+                inputState = inputState,
+                selection = selection,
+                toast = toast,
+                onBack = onBack,
+                onProfileClick = onProfileClick,
+                onForwardSelected = { showForwardSheet = true },
+                onDeleteSelected = { showDeleteDialog = true },
+                onOpenDatePicker = { showDatePicker = true },
+                onUnpinAll = { showUnpinAllDialog = true },
+                onHeaderMenuOpenChange = { isHeaderMenuOpen = it }
+            )
 
-                // ========== HEADER ==========
-                Box(
-                    modifier = Modifier
-                                                .padding(start = 12.dp, end = 12.dp, top = 6.dp)
-                        .fillMaxWidth()
-                        .zIndex(21f)
+            ChatMessageList(
+                // Список не пересчитывается под клавиатуру, а сдвигается на фазе draw.
+                modifier = Modifier.chatImeSlide().blur(messageListBlur),
+                viewModel = viewModel,
+                strings = strings,
+                listState = listState,
+                hazeState = hazeState,
+                liquidState = liquidState,
+                layoutState = layoutState,
+                selection = selection,
+                toast = toast,
+                messages = messages,
+                groupedMessages = listSnapshot.grouped,
+                messagesById = listSnapshot.byId,
+                messageLazyIndex = listSnapshot.lazyIndex,
+                pinnedIds = pinnedIds,
+                pendingInlineCallbacks = pendingInlineCallbacks,
+                highlightedMessageId = highlightedMessageId,
+                myAvatarUrl = myAvatarUrl,
+                partnerAvatarUrl = partnerUser?.avatarUrl,
+                partnerName = partnerUser?.name,
+                chatMusicPlaylist = chatMusicPlaylist,
+                onProfileClick = onProfileClick,
+                onPinRequest = { msg -> messageToPin = msg },
+                onUnpinRequest = { msg -> messageToUnpin = msg },
+                onReportRequest = { msg -> reportMessage = msg },
+                // Переслать / удалить одно сообщение: переиспользуем те же диалоги,
+                // что и мультивыделение, подставив в выделение ровно один id.
+                onForwardRequest = { msg ->
+                    selection.ids.clear()
+                    selection.ids.add(msg.id)
+                    transientSelection = true
+                    showForwardSheet = true
+                },
+                onDeleteRequest = { msg ->
+                    selection.ids.clear()
+                    selection.ids.add(msg.id)
+                    transientSelection = true
+                    showDeleteDialog = true
+                },
+                onMessageMenuOpenChange = { open -> messageMenuOpen.value = open },
+                onImageClick = { msg, idx ->
+                    viewingMessage = msg
+                    viewingPhotoIndex = idx
+                },
+                isMessageMenuOpen = messageMenuOpen.value
+            )
 
-                        .clip(androidx.compose.foundation.shape.RoundedCornerShape(20.dp))
-                        .hazeChild(state = hazeState)
-                        .background(androidx.compose.material3.MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.92f))
-                ) {
-                    Column(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(horizontal = 6.dp, vertical = 6.dp)
-                    ) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        if (selectedMessages.isNotEmpty()) {
-                            IconButton(onClick = { selectedMessages.clear() }) {
-                                Icon(
-                                    imageVector = Icons.AutoMirrored.Filled.ArrowBack,
-                                    contentDescription = "Clear selection",
-                                    tint = VibePrimary
-                                )
-                            }
-                            Text(
-                                text = strings.selectedMessagesCount(selectedMessages.size),
-                                color = androidx.compose.material3.MaterialTheme.colorScheme.onBackground,
-                                fontSize = 18.sp,
-                                fontWeight = FontWeight.Bold,
-                                modifier = Modifier.weight(1f)
-                            )
-                            IconButton(onClick = { showForwardSheet = true }) {
-                                Icon(
-                                    imageVector = Icons.AutoMirrored.Filled.Reply,
-                                    contentDescription = "Forward",
-                                    tint = VibePrimary,
-                                    modifier = Modifier.size(24.dp).scale(scaleX = -1f, scaleY = 1f)
-                                )
-                            }
-                            IconButton(onClick = { showDeleteDialog = true }) {
-                                Icon(
-                                    imageVector = Icons.Default.Delete,
-                                    contentDescription = "Delete",
-                                    tint = VibeError
-                                )
-                            }
-                        } else if (isSearchActive) {
-                            IconButton(onClick = { viewModel.closeSearch() }) {
-                                Icon(
-                                    imageVector = Icons.AutoMirrored.Filled.ArrowBack,
-                                    contentDescription = "Close search",
-                                    tint = VibePrimary
-                                )
-                            }
+            // Пункт 7: пока открыто меню сообщения, панель ввода уезжает под экран -
+            // ровно так же, как в списке чатов прячется таббар. Сдвиг делается в
+            // graphicsLayer, поэтому ни список, ни панель не перекомпозируются.
+            val bottomBarShift by animateFloatAsState(
+                targetValue = if (messageMenuOpen.value) 1f else 0f,
+                animationSpec = spring(
+                    dampingRatio = Spring.DampingRatioNoBouncy,
+                    stiffness = Spring.StiffnessMediumLow
+                ),
+                label = "chatBottomBarShift"
+            )
 
-                            BasicTextField(
-                                value = searchQuery,
-                                onValueChange = { viewModel.setSearchQuery(it) },
-                                textStyle = TextStyle(
-                                    color = MaterialTheme.colorScheme.onBackground,
-                                    fontSize = 16.sp
-                                ),
-                                cursorBrush = SolidColor(VibePrimary),
-                                singleLine = true,
-                                keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(
-                                    imeAction = androidx.compose.ui.text.input.ImeAction.Search
-                                ),
-                                keyboardActions = androidx.compose.foundation.text.KeyboardActions(
-                                    onSearch = {
-                                        val results = searchResults
-                                        if (results.isNotEmpty()) {
-                                            val target = results.getOrNull(currentSearchIndex) ?: results.first()
-                                            viewModel.jumpToMessage(target.id, messages)
-                                        }
-                                    }
-                                ),
-                                modifier = Modifier.weight(1f).padding(horizontal = 4.dp),
-                                decorationBox = { innerTextField ->
-                                    Box(contentAlignment = Alignment.CenterStart) {
-                                        if (searchQuery.isEmpty()) {
-                                            Text(
-                                                text = "Поиск сообщений...",
-                                                color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.45f),
-                                                fontSize = 15.sp
-                                            )
-                                        }
-                                        innerTextField()
-                                    }
-                                }
-                            )
-
-                            if (searchQuery.isNotEmpty()) {
-                                IconButton(
-                                    onClick = { viewModel.setSearchQuery("") },
-                                    modifier = Modifier.size(32.dp)
-                                ) {
-                                    Icon(
-                                        imageVector = Icons.Default.Close,
-                                        contentDescription = "Clear",
-                                        tint = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.5f),
-                                        modifier = Modifier.size(18.dp)
-                                    )
-                                }
-                            }
-
-                            IconButton(
-                                onClick = { showDatePicker = true },
-                                modifier = Modifier.size(36.dp)
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Default.CalendarMonth,
-                                    contentDescription = "Search by date",
-                                    tint = VibePrimary,
-                                    modifier = Modifier.size(22.dp)
-                                )
-                            }
-
-                            if (searchQuery.isNotBlank()) {
-                                if (searchResults.isNotEmpty()) {
-                                    Text(
-                                        text = "${currentSearchIndex + 1}/${searchResults.size}",
-                                        color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.6f),
-                                        fontSize = 12.sp,
-                                        fontWeight = FontWeight.SemiBold,
-                                        modifier = Modifier.padding(horizontal = 4.dp)
-                                    )
-                                    IconButton(
-                                        onClick = { viewModel.nextSearchResult(messages) },
-                                        modifier = Modifier.size(32.dp)
-                                    ) {
-                                        Icon(
-                                            imageVector = Icons.Default.KeyboardArrowUp,
-                                            contentDescription = "Next result (up)",
-                                            tint = VibePrimary,
-                                            modifier = Modifier.size(22.dp)
-                                        )
-                                    }
-                                    IconButton(
-                                        onClick = { viewModel.prevSearchResult(messages) },
-                                        modifier = Modifier.size(32.dp)
-                                    ) {
-                                        Icon(
-                                            imageVector = Icons.Default.KeyboardArrowDown,
-                                            contentDescription = "Previous result (down)",
-                                            tint = VibePrimary,
-                                            modifier = Modifier.size(22.dp)
-                                        )
-                                    }
-                                } else {
-                                    Text(
-                                        text = "0",
-                                        color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.4f),
-                                        fontSize = 12.sp,
-                                        modifier = Modifier.padding(horizontal = 6.dp)
-                                    )
-                                }
-                            }
-                        } else {
-                            IconButton(onClick = onBack) {
-                                Icon(
-                                    imageVector = Icons.AutoMirrored.Filled.ArrowBack,
-                                    contentDescription = strings.backBtn,
-                                    tint = VibePrimary
-                                )
-                            }
-                            Spacer(modifier = Modifier.width(4.dp))
-
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            modifier = Modifier
-                                                                .weight(1f)
-                                .zIndex(22f)
-                                .clip(RoundedCornerShape(8.dp))
-                                .clickable { onProfileClick(interlocutorId, displayName) }
-
-                                .padding(4.dp)
-                        ) {
-                            // 1. АВАТАРКА
-                            Box(
-                                modifier = Modifier
-                                    .size(40.dp)
-                                    .clip(CircleShape)
-                                    .background(VibePrimary),
-                                contentAlignment = Alignment.Center
-                            ) {
-                                if (!partnerUser?.avatarUrl.isNullOrEmpty() && partnerUser?.isBanned != true && partnerUser?.isFreezed != true && partnerUser?.isBlockedByUser != true) {
-                                    AsyncImage(
-                                        model = ImageRequest.Builder(LocalContext.current)
-                                            .data(partnerUser?.avatarUrl)
-                                            .crossfade(true)
-                                            .build(),
-                                        contentDescription = "Avatar",
-                                        contentScale = ContentScale.Crop,
-                                        modifier = Modifier.fillMaxSize()
-                                    )
-                                } else {
-                                    Text(
-                                        text = if (displayName.isNotEmpty()) displayName.take(1).uppercase() else "",
-                                        color = Color.White,
-                                        fontSize = 16.sp,
-                                        fontWeight = FontWeight.SemiBold
-                                    )
-                                }
-                            }
-
-                            Spacer(modifier = Modifier.width(10.dp))
-
-                            Column(modifier = Modifier.weight(1f)) {
-                                Row(verticalAlignment = Alignment.CenterVertically) {
-                                    /* // Если аккаунт заблокирован - перед ником выводим иконку мусорки
-                                    if (partnerUser?.isBanned == true) {
-                                        Icon(imageVector = Icons.Default.Delete, contentDescription = null, tint = Color.Gray, modifier = Modifier.size(16.dp))
-                                        Spacer(modifier = Modifier.width(4.dp))
-                                    } else if (partnerUser?.isFreezed == true) {
-                                        Icon(imageVector = Icons.Default.AcUnit, contentDescription = null, tint = Color(0xFF87CEEB), modifier = Modifier.size(16.dp))
-                                        Spacer(modifier = Modifier.width(4.dp))
-                                    }*/
-                                    Text(
-                                        text = displayName,
-                                        modifier = Modifier.weight(1f, fill = false),
-                                        style = androidx.compose.material3.MaterialTheme.typography.titleSmall,
-                                        color = androidx.compose.material3.MaterialTheme.colorScheme.onBackground,
-                                        maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis
-                                    )
-                                    Spacer(modifier = Modifier.width(4.dp))
-                                    com.flasskdev.vibe.ui.components.UserBadgesRow(
-                                        isVerified = partnerUser?.isVerified == true,
-                                        isDeveloper = partnerUser?.isDeveloper == true,
-                                        isBot = partnerUser?.isBot == true,
-                                        isBanned = partnerUser?.isBanned == true,
-                                        isFreezed = partnerUser?.isFreezed == true,
-                                        badgeSize = 14.dp
-                                    )
-                                }
-
-
-
-                                if (isPartnerTyping) {
-                                    Row(verticalAlignment = Alignment.CenterVertically) {
-                                        Text(
-                                            text = strings.typing,
-                                            color = VibePrimary,
-                                            fontSize = 12.sp,
-                                            fontWeight = FontWeight.Medium
-                                        )
-                                        Spacer(modifier = Modifier.width(4.dp))
-                                        TypingIndicator()
-                                    }
-                                } else {
-                                    val isBlocked = partnerUser?.isBlockedByUser == true || partnerUser?.isBanned == true || partnerUser?.isFreezed == true
-                                    val isBlockedByMe = partnerUser?.isBlockedByMe == true
-                                    val isOnline = partnerUser?.isOnline == true && !isBlocked && !isBlockedByMe && partnerUser?.isBot != true
-
-                                    val statusText = when {
-                                        isBlocked -> strings.lastSeenLongAgo
-                                        isBlockedByMe -> "Заблокирован"
-                                        partnerUser?.isBot == true -> strings.statusBot
-                                        isOnline -> strings.statusOnline
-                                        partnerUser?.lastSeenStatus == "hidden" || partnerUser?.lastSeenStatus == "approximate" || partnerUser?.lastSeenStatus == "recently" -> strings.lastSeenRecently
-                                        partnerUser?.lastSeenStatus == "long_ago" -> strings.lastSeenLongAgo
-                                        partnerUser?.lastSeenStatus == "this_week" -> strings.lastSeenInWeek
-                                        partnerUser?.lastSeenStatus == "this_month" -> strings.lastSeenInMonth
-                                        else -> formatLastSeen(partnerUser?.lastSeen, strings)
-                                    }
-                                    Text(
-                                        text = statusText,
-                                        style = androidx.compose.material3.MaterialTheme.typography.labelSmall,
-                                        color = if (isBlockedByMe) com.flasskdev.vibe.ui.theme.VibeError
-                                            else if (isOnline) VibeOnlineGreen
-                                            else androidx.compose.material3.MaterialTheme.colorScheme.onBackground.copy(alpha = 0.45f)
-                                    )
-                                }
-                            }
-                        } // close profile Row
-                            // Three-dots menu button
-                            var showHeaderMenu by remember { mutableStateOf(false) }
-                            Box {
-                                IconButton(onClick = { showHeaderMenu = true }) {
-                                    Icon(
-                                        imageVector = Icons.Default.MoreVert,
-                                        contentDescription = "Menu",
-                                        tint = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.6f)
-                                    )
-                                }
-                                DropdownMenu(
-                                    expanded = showHeaderMenu,
-                                    onDismissRequest = { showHeaderMenu = false }
-                                ) {
-                                    DropdownMenuItem(
-                                        text = { Text("Поиск") },
-                                        onClick = {
-                                            showHeaderMenu = false
-                                            viewModel.openSearch()
-                                        },
-                                        leadingIcon = {
-                                            Icon(
-                                                imageVector = Icons.Default.Search,
-                                                contentDescription = null,
-                                                tint = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f)
-                                            )
-                                        }
-                                    )
-
-                                    DropdownMenuItem(
-                                        text = { Text("Поиск по дате") },
-                                        onClick = {
-                                            showHeaderMenu = false
-                                            showDatePicker = true
-                                        },
-                                        leadingIcon = {
-                                            Icon(
-                                                imageVector = Icons.Default.CalendarMonth,
-                                                contentDescription = null,
-                                                tint = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f)
-                                            )
-                                        }
-                                    )
-
-                                    DropdownMenuItem(
-                                        text = { Text(strings.formatFormat, fontWeight = if (showFormattingBar) FontWeight.Bold else FontWeight.Normal) },
-                                        onClick = {
-                                            showFormattingBar = !showFormattingBar
-                                            if (!showFormattingBar) {
-                                                showPreviewMode = false
-                                            }
-                                            showHeaderMenu = false
-                                        },
-                                        leadingIcon = {
-                                            Icon(
-                                                imageVector = Icons.Default.FormatBold,
-                                                contentDescription = null,
-                                                tint = if (showFormattingBar) VibePrimary else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f)
-                                            )
-                                        }
-                                    )
-
-                                    if (effectiveUser?.isBot != true) {
-                                        if (isBlockedByMe) {
-                                            DropdownMenuItem(
-                                                text = { Text("Разблокировать", color = MaterialTheme.colorScheme.onSurface) },
-                                                onClick = {
-                                                    viewModel.unblockUser(interlocutorId)
-                                                    showHeaderMenu = false
-                                                    triggerToast("Пользователь разблокирован")
-                                                },
-                                                leadingIcon = {
-                                                    Icon(
-                                                        imageVector = Icons.Outlined.LockOpen,
-                                                        contentDescription = null,
-                                                        tint = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f)
-                                                    )
-                                                }
-                                            )
-                                        } else {
-                                            DropdownMenuItem(
-                                                text = { Text("Заблокировать", color = VibeError) },
-                                                onClick = {
-                                                    viewModel.blockUser(interlocutorId)
-                                                    showHeaderMenu = false
-                                                },
-                                                leadingIcon = {
-                                                    Icon(
-                                                        imageVector = Icons.Outlined.Block,
-                                                        contentDescription = null,
-                                                        tint = VibeError
-                                                    )
-                                                }
-                                            )
-                                        }
-                                    }
-                                }
-                            }
-                        } // close else block
-                    } // close header Row
-
-                    // ========== PINNED MESSAGES HEADER ==========
-                    if (pinnedMessages.isNotEmpty()) {
-                        Box(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .height(1.dp)
-                                .background(androidx.compose.material3.MaterialTheme.colorScheme.onSurface.copy(alpha = 0.1f))
-                        )
-                        
-                                                val currentMsg = pinnedMessages.getOrNull(currentPinnedIndex) ?: pinnedMessages.first()
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .clip(RoundedCornerShape(12.dp))
-                                .clickable { viewModel.jumpToMessage(currentMsg.id, messages) }
-                                .padding(horizontal = 4.dp, vertical = 4.dp),
-
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Row(
-                                verticalAlignment = Alignment.CenterVertically,
-                                modifier = Modifier.padding(end = 12.dp)
-                            ) {
-                                val count = pinnedMessages.size
-                                // Pinned messages are ordered newest-first; the banner number must use the same order.
-                                val currentIndexNum = currentPinnedIndex + 1
-
-                                Text(
-                                    text = "$currentIndexNum/$count",
-                                    color = VibePrimary,
-                                    fontSize = 12.sp,
-                                    fontWeight = FontWeight.Bold,
-                                    modifier = Modifier.padding(end = 8.dp, start = 4.dp)
-                                )
-                                
-                                Box(
-                                    modifier = Modifier
-                                        .width(2.dp)
-                                        .height(36.dp)
-                                        .clip(RoundedCornerShape(1.dp))
-                                        .background(VibePrimary)
-                                )
-                            }
-                            
-                            Column(modifier = Modifier.weight(1f)) {
-                                Text(
-                                    text = if (pinnedMessages.size > 1) strings.pinnedMessages else strings.pinnedMessage,
-                                    color = VibePrimary,
-                                    fontSize = 13.sp,
-                                    fontWeight = FontWeight.Bold
-                                )
-                                Spacer(modifier = Modifier.height(2.dp))
-                                
-                                MessagePreviewBlock(
-                                    message = currentMsg,
-                                    textColor = androidx.compose.material3.MaterialTheme.colorScheme.onBackground.copy(alpha = 0.8f),
-                                    fontSize = 14.sp
-                                )
-                            }
-
-                            IconButton(
-                                onClick = { showUnpinAllDialog = true },
-                                modifier = Modifier.size(32.dp)
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Default.Close,
-                                    contentDescription = "Unpin all",
-                                    tint = androidx.compose.material3.MaterialTheme.colorScheme.onBackground.copy(alpha = 0.4f),
-                                    modifier = Modifier.size(20.dp)
-                                )
-                            }
-                        }
-                    }
-                    // ========== MINI PLAYER (under pinned/topbar) ==========
-                    val chatHazeState = remember { dev.chrisbanes.haze.HazeState() }
-                    var showChatExpandedPlayer by remember { mutableStateOf(false) }
-                    com.flasskdev.vibe.ui.components.GlobalMiniPlayer(
-                        viewModel = audioPlayer,
-                        hazeState = chatHazeState,
-                        isInline = true,
-                        onExpand = { showChatExpandedPlayer = true }
-                    )
-                    if (showChatExpandedPlayer) {
-                        com.flasskdev.vibe.ui.components.ExpandedAudioPlayerSheet(
-                            viewModel = audioPlayer,
-                            hazeState = chatHazeState,
-                            onDismiss = { showChatExpandedPlayer = false }
-                        )
-                    }
-
-                    } // close Column
-                } // close Box
-            }
-
-                        LaunchedEffect(highlightedMessageId, messageLazyIndex) {
-                val targetIndex = highlightedMessageId?.let(messageLazyIndex::get)
-                if (targetIndex != null) {
-                    // scrollToItem performs a deterministic jump and supersedes the prior scroll mutation.
-                    listState.scrollToItem(targetIndex)
-                }
-            }
-
-            // Keep the scrolling content below the top chrome. This is a sibling-level layer boundary.
-            Box(
+            ChatInputBar(
+                // Единственный участник иерархии, которому нужен реальный ime-инсет.
                 modifier = Modifier
                     .fillMaxSize()
-                    .zIndex(0f)
-                    .clipToBounds()
-                    .liquefiable(liquidState)
-                    .haze(hazeState)
-            ) {
-
-                if (messages.isEmpty()) {
-                    Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                            Icon(
-                                imageVector = androidx.compose.material.icons.Icons.Filled.Forum,
-                                contentDescription = null,
-                                tint = VibePrimary.copy(alpha = 0.5f),
-                                modifier = Modifier.size(64.dp)
-                            )
-                            Spacer(modifier = Modifier.height(16.dp))
-                            Text(
-                                text = strings.emptyChat ?: "Здесь пока пусто...",
-                                color = androidx.compose.material3.MaterialTheme.colorScheme.onBackground.copy(alpha = 0.5f),
-                                fontSize = 16.sp,
-                                fontWeight = FontWeight.Medium
-                            )
-                        }
+                    .imePadding()
+                    .graphicsLayer {
+                        if (bottomBarShift <= 0f) return@graphicsLayer
+                        translationY = layoutState.bottomBarHeightPx * bottomBarShift
+                        alpha = 1f - bottomBarShift
                     }
-                } else {
-                    val pinnedIds = remember(pinnedMessages) { pinnedMessages.mapTo(HashSet()) { it.id } }
-                    LazyColumn(
-                        modifier = Modifier.fillMaxSize().padding(horizontal = 12.dp),
-                        state = listState,
-                        reverseLayout = true,
-                        contentPadding = PaddingValues(top = 160.dp, bottom = 120.dp)
-                ) {
-                    groupedMessages.forEach { (dateMillis, messagesInDay) ->
-                        itemsIndexed(messagesInDay, key = { _, it -> it.id }) { index, message ->
-                            val isNewerSame = messagesInDay.getOrNull(index - 1)?.senderId == message.senderId
-                            val isOlderSame = messagesInDay.getOrNull(index + 1)?.senderId == message.senderId
-                            
-                            if (message.content.startsWith("\$\$SYSTEM\$\$PINNED_MESSAGE|")) {
-                                val parts = message.content.substringAfter("\$\$SYSTEM\$\$PINNED_MESSAGE|").split("|")
-                                val senderN = parts.getOrNull(0) ?: "Someone"
-                                val msgContent = parts.getOrNull(1) ?: ""
-                                val sysText = strings.pinnedMessageSystemText(senderN, msgContent)
-                                Box(
-                                                                        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
-
-                                    contentAlignment = Alignment.Center
-                                ) {
-                                    Surface(
-                                        color = androidx.compose.material3.MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
-                                        shape = RoundedCornerShape(12.dp),
-                                        modifier = Modifier.padding(horizontal = 32.dp)
-                                    ) {
-                                        Text(
-                                            text = sysText,
-                                            fontSize = 12.sp,
-                                            color = androidx.compose.material3.MaterialTheme.colorScheme.onBackground.copy(alpha = 0.8f),
-                                            textAlign = androidx.compose.ui.text.style.TextAlign.Center,
-                                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp)
-                                        )
-                                    }
-                                }
-                            } else {
-                                MessageBubble(
-                                                                        modifier = Modifier.padding(
-
-                                        bottom = if (isNewerSame) 2.dp else 12.dp
-                                    ),
-                                    message = message,
-                                    repliedMessage = message.replyToId?.let { messagesById[it] },
-                                    isMine = message.senderId == viewModel.myUserId,
-                                    isNewerSameSender = isNewerSame,
-                                    isOlderSameSender = isOlderSame,
-                                    strings = strings,
-                                    isHighlighted = message.id == highlightedMessageId,
-                                    onReply = { viewModel.replyToMessage(it) },
-                                    onReplyClick = { replyId -> viewModel.jumpToMessage(replyId, messages) },
-                                    onEditClick = { viewModel.startEditing(it) },
-                                    isPinned = message.id in pinnedIds,
-                                    onPinRequest = { msg -> 
-                                        messageToPin = msg
-                                    },
-                                    onUnpinRequest = { msg ->
-                                        messageToUnpin = msg
-                                    },
-                                    isSelected = selectedMessages.contains(message.id),
-                                    selectionMode = selectedMessages.isNotEmpty(),
-                                    onSelect = {
-                                        if (selectedMessages.contains(message.id)) {
-                                            selectedMessages.remove(message.id)
-                                        } else {
-                                            if (selectedMessages.size < 10) {
-                                                selectedMessages.add(message.id)
-                                            }
-                                        }
-                                    },
-                                    onReportClick = { reportMessage = it },
-                                    onProfileClick = onProfileClick,
-                                    onShowCopyToast = { triggerToast("Скопировано") },
-                                    onImageClick = { msg, idx ->
-                                        viewingMessage = msg
-                                        viewingPhotoIndex = idx
-                                    },
-                                    onRetryUpload = { msgId -> viewModel.retryUpload(context, msgId) },
-                                    myAvatarUrl = myAvatarUrl,
-                                                                        partnerAvatarUrl = partnerUser?.avatarUrl,
-                                    partnerName = partnerUser?.name,
-                                    myDisplayName = viewModel.myDisplayName,
-                                    myUserId = viewModel.myUserId,
-
-                                    onReactionToggle = { msg, emoji -> viewModel.toggleReaction(msg, emoji) },
-                                    onReactionLongClick = { msg, emoji -> viewModel.openReactionDetails(msg, emoji) },
-                                                                        inlineKeyboardEnabled = !pendingInlineCallbacks.containsKey(message.id),
-                                    pendingInlineCallbackData = pendingInlineCallbacks[message.id]?.callbackData,
-                                    onInlineButtonClick = { msg, btn ->
-                                        viewModel.onInlineButtonClicked(msg, btn) { url ->
-
-                                            try {
-                                                val uri = android.net.Uri.parse(url)
-                                                context.startActivity(android.content.Intent(android.content.Intent.ACTION_VIEW, uri))
-                                            } catch (e: Exception) {
-                                                triggerToast("Не удалось открыть ссылку")
-                                            }
-                                        }
-                                    },
-                                    chatPlaylist = chatMusicPlaylist,
-                                    liquidState = liquidState
-                                )
-                            }
-                        }
-
-                        item(key = "date_$dateMillis") {
-                            DateSeparator(
-                                                                modifier = Modifier,
-                                dateMillis = dateMillis,
-
-                                strings = strings
-                            )
-                        }
-                    }
-                }
-                } // Close else block
-
-                // Кнопка "Вниз"
-                val showFab by remember {
-                    derivedStateOf {
-                        (listState.canScrollBackward || viewModel.isContextMode) && messages.isNotEmpty()
-                    }
-                }
-                androidx.compose.animation.AnimatedVisibility(
-                    visible = showFab,
-                    enter = androidx.compose.animation.scaleIn() + androidx.compose.animation.fadeIn(),
-                    exit = androidx.compose.animation.scaleOut() + androidx.compose.animation.fadeOut(),
-                    modifier = Modifier
-                        .align(Alignment.BottomEnd)
-                        .padding(end = 16.dp, bottom = 88.dp)
-                ) {
-                    Box {
-                        androidx.compose.material3.FloatingActionButton(
-                            onClick = {
-                                if (!viewModel.isContextMode && listState.canScrollBackward) {
-                                    scope.launch {
-                                        val current = listState.firstVisibleItemIndex
-                                        if (current > 15) {
-                                            listState.scrollToItem(15)
-                                        }
-                                        listState.animateScrollToItem(0)
-                                    }
-                                } else {
-                                    viewModel.jumpToBottom()
-                                }
-                            },
-                            containerColor = androidx.compose.material3.MaterialTheme.colorScheme.surface,
-                            contentColor = VibePrimary,
-                            modifier = Modifier.size(48.dp)
-                        ) {
-                            Icon(androidx.compose.material.icons.Icons.Default.ArrowDownward, contentDescription = "Вниз")
-                        }
-                        
-                        if (newMessagesCount > 0) {
-                            Box(
-                                modifier = Modifier
-                                    .align(Alignment.TopStart)
-                                    .offset(x = (-4).dp, y = (-4).dp)
-                                    .size(20.dp)
-                                    .clip(androidx.compose.foundation.shape.CircleShape)
-                                    .background(Color.Red),
-                                contentAlignment = Alignment.Center
-                            ) {
-                                Text(
-                                    text = if (newMessagesCount > 99) "99+" else newMessagesCount.toString(),
-                                    color = Color.White,
-                                    fontSize = 10.sp,
-                                    fontWeight = FontWeight.Bold
-                                )
-                            }
-                        }
-                    }
-                }
-            }
-
-            val replyingToMessage by viewModel.replyingToMessage.collectAsState()
-
-            val canSendTextOrPhoto = inputTextFieldValue.text.isNotBlank() || pendingPhotos.isNotEmpty() || pendingFiles.isNotEmpty()
-            var dragOffset by remember { mutableStateOf(0f) }
-            var dragOffsetY by remember { mutableStateOf(0f) }
-            var isLocked by remember { mutableStateOf(false) }
-
-            if (isRecording && !isLocked) {
-                Box(
-                    modifier = Modifier
-                        .align(Alignment.BottomEnd)
-                        .navigationBarsPadding()
-                        .padding(end = 28.dp, bottom = 90.dp)
-                ) {
-                    Column(
-                        modifier = Modifier
-                            .clip(RoundedCornerShape(16.dp))
-                            .background(androidx.compose.material3.MaterialTheme.colorScheme.surface.copy(alpha = 0.9f))
-                            .border(1.dp, androidx.compose.material3.MaterialTheme.colorScheme.onSurface.copy(alpha = 0.1f), RoundedCornerShape(16.dp))
-                            .padding(vertical = 12.dp, horizontal = 8.dp),
-                        horizontalAlignment = Alignment.CenterHorizontally
-                    ) {
-                        Icon(androidx.compose.material.icons.Icons.Default.Lock, contentDescription = "Lock", tint = VibePrimary, modifier = Modifier.size(24.dp))
-                        Spacer(modifier = Modifier.height(4.dp))
-                        Icon(androidx.compose.material.icons.Icons.Default.KeyboardArrowUp, contentDescription = null, tint = VibePrimary.copy(alpha = 0.5f), modifier = Modifier.size(20.dp))
-                    }
-                }
-            }
-
-            Column(
-                modifier = Modifier
-                    .align(Alignment.BottomCenter)
-                    .navigationBarsPadding()
-                    .fillMaxWidth()
-            ) {
-            // Inline emoji/sticker/GIF panel: slides up in place of the keyboard,
-            // ABOVE the input bar so it never covers the text field.
-            AnimatedVisibility(
-                visible = showEmojiPanel,
-                enter = expandVertically(animationSpec = tween(180)) + fadeIn(tween(180)),
-                exit = shrinkVertically(animationSpec = tween(160)) + fadeOut(tween(120))
-            ) {
-                com.flasskdev.vibe.ui.components.EmojiStickerGifPanel(
-                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp),
-                    onEmojiClick = { emoji ->
-                        val sel = inputTextFieldValue.selection
-                        val start = minOf(sel.start, sel.end).coerceIn(0, inputTextFieldValue.text.length)
-                        val end = maxOf(sel.start, sel.end).coerceIn(0, inputTextFieldValue.text.length)
-                        val newText = inputTextFieldValue.text.replaceRange(start, end, emoji)
-                        if (newText.length <= 2048) {
-                            inputTextFieldValue = TextFieldValue(newText, androidx.compose.ui.text.TextRange(start + emoji.length))
-                            viewModel.onTextChanged(newText)
-                        }
-                    },
-                    onStickerClick = { stickerId ->
-                        viewModel.sendSticker(stickerId)
-                        showEmojiPanel = false
-                    },
-                    onGifClick = { gif ->
-                        viewModel.sendGif(gif.fullUrl, gif.width, gif.height)
-                        showEmojiPanel = false
-                    }
-                )
-            }
-
-            Box(
-                modifier = Modifier
-                    .padding(start = 12.dp, end = 12.dp, bottom = 12.dp)
-                    .fillMaxWidth()
-                    .clip(RoundedCornerShape(22.dp))
-                    .hazeChild(state = hazeState)
-                    .background(androidx.compose.material3.MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.92f))
-            ) {
-                Column {
-                    AnimatedVisibility(
-                        visible = replyingToMessage != null,
-                        enter = expandVertically() + fadeIn(),
-                        exit = shrinkVertically() + fadeOut()
-                    ) {
-                        if (replyingToMessage != null) {
-                            Column {
-                                Row(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .padding(horizontal = 16.dp, vertical = 8.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Icon(Icons.AutoMirrored.Filled.Reply, contentDescription = null, tint = VibePrimary, modifier = Modifier.size(24.dp))
-                                Spacer(modifier = Modifier.width(12.dp))
-                                Box(
-                                    modifier = Modifier
-                                        .width(4.dp)
-                                        .height(36.dp)
-                                        .background(VibePrimary, RoundedCornerShape(2.dp))
-                                )
-                                Spacer(modifier = Modifier.width(8.dp))
-                                Column(modifier = Modifier.weight(1f)) {
-                                    val replyName = if (replyingToMessage!!.senderId == viewModel.myUserId) strings.replyDefault else displayName
-                                    Text(
-                                        text = replyName, 
-                                        color = VibePrimary, 
-                                        fontSize = 14.sp, 
-                                        fontWeight = FontWeight.Bold,
-                                        maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis
-                                    )
-                                    MessagePreviewBlock(
-                                        message = replyingToMessage!!,
-                                        textColor = androidx.compose.material3.MaterialTheme.colorScheme.onSurface,
-                                        fontSize = 13.sp
-                                    )
-                                }
-                                IconButton(onClick = { viewModel.cancelReply() }, modifier = Modifier.size(32.dp)) {
-                                    Icon(Icons.Default.Close, contentDescription = "Cancel", tint = androidx.compose.material3.MaterialTheme.colorScheme.onBackground.copy(alpha = 0.5f), modifier = Modifier.size(20.dp))
-                                }
-                            }
-                                Box(modifier = Modifier.fillMaxWidth().height(1.dp).background(androidx.compose.material3.MaterialTheme.colorScheme.onSurface.copy(alpha = 0.1f)))
-                            }
-                        }
-                    }
-                    AnimatedVisibility(
-                        visible = editingMessage != null,
-                        enter = expandVertically() + fadeIn(),
-                        exit = shrinkVertically() + fadeOut()
-                    ) {
-                        if (editingMessage != null) {
-                            Column {
-                                Row(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .padding(horizontal = 16.dp, vertical = 8.dp),
-                                    verticalAlignment = Alignment.CenterVertically
-                                ) {
-                                    Icon(Icons.Default.Edit, contentDescription = null, tint = VibePrimary, modifier = Modifier.size(24.dp))
-                                    Spacer(modifier = Modifier.width(12.dp))
-                                    Box(
-                                        modifier = Modifier
-                                            .width(4.dp)
-                                            .height(36.dp)
-                                            .background(VibePrimary, RoundedCornerShape(2.dp))
-                                    )
-                                    Spacer(modifier = Modifier.width(8.dp))
-                                    Column(modifier = Modifier.weight(1f)) {
-                                        Text(strings.editMessageTitle, color = VibePrimary, fontSize = 14.sp, fontWeight = FontWeight.Bold)
-                                        val editContent = editingMessage!!.content.replace("\n", " ")
-                                        if (com.flasskdev.vibe.utils.TextFormatting.hasFormatting(editContent)) {
-                                            FormattedText(
-                                                text = editContent,
-                                                baseColor = androidx.compose.material3.MaterialTheme.colorScheme.onSurface,
-                                                fontSize = 13.sp,
-                                                lineHeight = 16.sp,
-                                                maxLines = 1,
-                                                interactive = false
-                                            )
-                                        } else {
-                                            Text(
-                                                text = editContent, 
-                                                color = androidx.compose.material3.MaterialTheme.colorScheme.onSurface, 
-                                                fontSize = 13.sp, 
-                                                maxLines = 1,
-                                                overflow = TextOverflow.Ellipsis
-                                            )
-                                        }
-                                    }
-                                    IconButton(onClick = { 
-                                        viewModel.cancelEditing() 
-                                        inputTextFieldValue = TextFieldValue("")
-                                    }, modifier = Modifier.size(32.dp)) {
-                                        Icon(Icons.Default.Close, contentDescription = "Cancel", tint = androidx.compose.material3.MaterialTheme.colorScheme.onBackground.copy(alpha = 0.5f), modifier = Modifier.size(20.dp))
-                                    }
-                                }
-                                Box(modifier = Modifier.fillMaxWidth().height(1.dp).background(androidx.compose.material3.MaterialTheme.colorScheme.onSurface.copy(alpha = 0.1f)))
-                            }
-                        }
-                    }
-
-                    if (isBlockedByMe) {
-                        Column(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(horizontal = 16.dp, vertical = 12.dp),
-                            horizontalAlignment = Alignment.CenterHorizontally
-                        ) {
-                            Text(
-                                text = "Вы заблокировали пользователя",
-                                color = androidx.compose.material3.MaterialTheme.colorScheme.onBackground.copy(alpha = 0.6f),
-                                fontSize = 14.sp
-                            )
-                            Spacer(modifier = Modifier.height(10.dp))
-                            androidx.compose.material3.Button(
-                                onClick = { 
-                                    viewModel.unblockUser(interlocutorId)
-                                    triggerToast("Пользователь разблокирован")
-                                },
-                                colors = androidx.compose.material3.ButtonDefaults.buttonColors(containerColor = VibePrimary),
-                                shape = RoundedCornerShape(12.dp),
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .height(42.dp)
-                            ) {
-                                Text(
-                                    text = "Разблокировать",
-                                    color = Color.White,
-                                    fontWeight = FontWeight.SemiBold,
-                                    fontSize = 14.sp
-                                )
-                            }
-                        }
-                    } else if (effectiveUser?.canMessage != false) {
-                        AnimatedVisibility(
-                            visible = pendingPhotos.isNotEmpty() || pendingFiles.isNotEmpty(),
-                            enter = expandVertically() + fadeIn(),
-                            exit = shrinkVertically() + fadeOut()
-                        ) {
-                            Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp)) {
-                                Row(
-                                    modifier = Modifier.fillMaxWidth(),
-                                    horizontalArrangement = Arrangement.SpaceBetween,
-                                    verticalAlignment = Alignment.CenterVertically
-                                ) {
-                                                                        val selectedVideoCount = pendingPhotos.count { uri ->
-                                        val mimeType = context.contentResolver.getType(uri).orEmpty()
-                                        mimeType.startsWith("video/") || com.flasskdev.vibe.utils.AttachmentUtils.isPlayableVideo(uri.toString())
-                                    }
-                                    val selectedPhotoCount = pendingPhotos.size - selectedVideoCount
-                                    val countText = buildList {
-                                        if (selectedPhotoCount > 0) add("$selectedPhotoCount фото")
-                                        if (selectedVideoCount > 0) add("$selectedVideoCount видео")
-                                        if (pendingFiles.isNotEmpty()) add("${pendingFiles.size} файл(ов)")
-                                    }.joinToString(", ").ifBlank { "Нет вложений" }
-                                    Text(
-                                        text = "Выбрано: $countText",
-
-                                        color = VibePrimary,
-                                        fontSize = 14.sp,
-                                        fontWeight = FontWeight.Bold
-                                    )
-                                    IconButton(onClick = { 
-                                        pendingPhotos = emptyList() 
-                                        pendingFiles = emptyList()
-                                    }, modifier = Modifier.size(24.dp)) {
-                                        Icon(Icons.Default.Close, contentDescription = "Clear", tint = androidx.compose.material3.MaterialTheme.colorScheme.onBackground.copy(alpha = 0.5f))
-                                    }
-                                }
-                                Spacer(modifier = Modifier.height(8.dp))
-                                Row(
-                                    modifier = Modifier.horizontalScroll(rememberScrollState()),
-                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                                ) {
-                                                                        pendingPhotos.forEach { uri ->
-                                        val isVideo = context.contentResolver.getType(uri).orEmpty().startsWith("video/") ||
-                                            com.flasskdev.vibe.utils.AttachmentUtils.isPlayableVideo(uri.toString())
-                                        Box(
-                                            modifier = Modifier
-                                                .size(64.dp)
-                                                .clip(RoundedCornerShape(8.dp))
-                                                .background(androidx.compose.material3.MaterialTheme.colorScheme.surfaceVariant),
-                                            contentAlignment = Alignment.Center
-                                        ) {
-                                            if (isVideo) {
-                                                com.flasskdev.vibe.ui.components.VideoCover(
-                                                    source = pendingVideoCoverPaths[uri.toString()]?.let { coverPath -> java.io.File(coverPath) } ?: uri,
-                                                    modifier = Modifier.fillMaxSize(),
-                                                    frameMillis = 500L
-                                                )
-                                            } else {
-                                                AsyncImage(
-                                                    model = ImageRequest.Builder(LocalContext.current)
-                                                        .data(uri)
-                                                        .crossfade(true)
-                                                        .build(),
-                                                    contentDescription = "Выбранное фото",
-                                                    contentScale = ContentScale.Crop,
-                                                    modifier = Modifier.fillMaxSize()
-                                                )
-                                            }
-                                        }
-                                    }
-
-                                    pendingFiles.forEach { uri ->
-                                        val filename = androidx.documentfile.provider.DocumentFile.fromSingleUri(context, uri)?.name ?: "File"
-                                        Box(
-                                            modifier = Modifier
-                                                .size(64.dp)
-                                                .clip(RoundedCornerShape(8.dp))
-                                                .background(androidx.compose.material3.MaterialTheme.colorScheme.surfaceVariant),
-                                            contentAlignment = Alignment.Center
-                                        ) {
-                                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                                                Icon(Icons.Default.Code, contentDescription = null, tint = VibePrimary, modifier = Modifier.size(24.dp))
-                                                Text(filename, fontSize = 10.sp, color = VibePrimary, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.padding(horizontal = 4.dp))
-                                            }
-                                        }
-                                    }
-                                }
-                                Spacer(modifier = Modifier.height(8.dp))
-                                Box(modifier = Modifier.fillMaxWidth().height(1.dp).background(androidx.compose.material3.MaterialTheme.colorScheme.onSurface.copy(alpha = 0.1f)))
-                            }
-                        }
-
-                        // Formatting toolbar (shown when format mode is active)
-                        AnimatedVisibility(
-                            visible = showFormattingBar,
-                            enter = expandVertically() + fadeIn(),
-                            exit = shrinkVertically() + fadeOut()
-                        ) {
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .horizontalScroll(rememberScrollState())
-                                    .padding(horizontal = 8.dp, vertical = 4.dp),
-                                horizontalArrangement = Arrangement.spacedBy(4.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                // Bold
-                                FormatButton(Icons.Default.FormatBold) {
-                                    inputTextFieldValue = insertFormatMarker(inputTextFieldValue, "**", "**")
-                                }
-                                // Italic
-                                FormatButton(Icons.Default.FormatItalic) {
-                                    inputTextFieldValue = insertFormatMarker(inputTextFieldValue, "__", "__")
-                                }
-                                // Strikethrough
-                                FormatButton(Icons.Default.FormatStrikethrough) {
-                                    inputTextFieldValue = insertFormatMarker(inputTextFieldValue, "~~", "~~")
-                                }
-                                // Underline
-                                FormatButton(Icons.Default.FormatUnderlined) {
-                                    inputTextFieldValue = insertFormatMarker(inputTextFieldValue, "--", "--")
-                                }
-                                // Monospace
-                                FormatButton(Icons.Default.Code) {
-                                    inputTextFieldValue = insertFormatMarker(inputTextFieldValue, "`", "`")
-                                }
-                                // Link
-                                FormatButton(Icons.Default.Link) {
-                                    val sel = inputTextFieldValue.selection
-                                    linkInputSelection = sel
-                                    val start = minOf(sel.start, sel.end).coerceIn(0, inputTextFieldValue.text.length)
-                                    val end = maxOf(sel.start, sel.end).coerceIn(0, inputTextFieldValue.text.length)
-                                    linkInputInitialText = if (start != end) inputTextFieldValue.text.substring(start, end) else ""
-                                    showLinkInputDialog = true
-                                }
-                                // Color
-                                FormatButton(Icons.Default.Palette) {
-                                    val sel = inputTextFieldValue.selection
-                                    colorInputSelection = sel
-                                    val start = minOf(sel.start, sel.end).coerceIn(0, inputTextFieldValue.text.length)
-                                    val end = maxOf(sel.start, sel.end).coerceIn(0, inputTextFieldValue.text.length)
-                                    colorInputInitialText = if (start != end) inputTextFieldValue.text.substring(start, end) else ""
-                                    showColorInputDialog = true
-                                }
-                                // Spoiler
-                                FormatButton(Icons.Default.VisibilityOff) {
-                                    inputTextFieldValue = insertFormatMarker(inputTextFieldValue, "||", "||")
-                                }
-                                // Quote
-                                FormatButton(Icons.Default.FormatQuote) {
-                                    inputTextFieldValue = insertFormatMarker(inputTextFieldValue, ">>", "")
-                                }
-                            }
-                            Box(modifier = Modifier.fillMaxWidth().height(1.dp).background(androidx.compose.material3.MaterialTheme.colorScheme.onSurface.copy(alpha = 0.1f)))
-                        }
-
-                        // Preview bar
-                        com.flasskdev.vibe.ui.components.InputPreviewBar(
-                            inputText = inputTextFieldValue.text,
-                            visible = showPreviewMode,
-                            strings = strings
-                        )
-
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(horizontal = 12.dp, vertical = 6.dp),
-                            verticalAlignment = Alignment.Bottom
-                        ) {
-                            AnimatedVisibility(visible = !isRecording) {
-                                Row(verticalAlignment = Alignment.CenterVertically) {
-                                    // Attachment button (paperclip)
-                                    IconButton(
-                                        onClick = { showAttachmentMenu = true },
-                                        modifier = Modifier
-                                            .size(40.dp)
-                                            .padding(bottom = 4.dp)
-                                    ) {
-                                        Icon(
-                                            imageVector = Icons.Default.AttachFile,
-                                            contentDescription = "Attach",
-                                            tint = androidx.compose.material3.MaterialTheme.colorScheme.onBackground.copy(alpha = 0.6f),
-                                            modifier = Modifier.size(24.dp)
-                                        )
-                                    }
-
-                                    // Emoji / sticker / GIF button (single entry, tabbed panel)
-                                    IconButton(
-                                        onClick = {
-                                            if (showEmojiPanel) {
-                                                showEmojiPanel = false
-                                            } else {
-                                                keyboardController?.hide()
-                                                showEmojiPanel = true
-                                            }
-                                        },
-                                        modifier = Modifier
-                                            .size(40.dp)
-                                            .padding(bottom = 4.dp)
-                                    ) {
-                                        Icon(
-                                            imageVector = Icons.Default.EmojiEmotions,
-                                            contentDescription = "Emoji, stickers and GIFs",
-                                            tint = if (showEmojiPanel) VibePrimary else androidx.compose.material3.MaterialTheme.colorScheme.onBackground.copy(alpha = 0.6f),
-                                            modifier = Modifier.size(24.dp)
-                                        )
-                                    }
-
-                                    // Preview toggle button (eye icon) - shown ONLY when formatting mode is active
-                                    AnimatedVisibility(
-                                        visible = showFormattingBar,
-                                        enter = fadeIn() + expandHorizontally(),
-                                        exit = fadeOut() + shrinkHorizontally()
-                                    ) {
-                                        IconButton(
-                                            onClick = { showPreviewMode = !showPreviewMode },
-                                            modifier = Modifier
-                                                .size(40.dp)
-                                                .padding(bottom = 4.dp)
-                                        ) {
-                                            Icon(
-                                                imageVector = if (showPreviewMode) Icons.Default.Visibility else Icons.Default.VisibilityOff,
-                                                contentDescription = "Preview formatting",
-                                                tint = if (showPreviewMode) VibePrimary else androidx.compose.material3.MaterialTheme.colorScheme.onBackground.copy(alpha = 0.6f),
-                                                modifier = Modifier.size(22.dp)
-                                            )
-                                        }
-                                    }
-                                }
-                            }
-                            
-                            if (isRecording) {
-                                Row(
-                                    modifier = Modifier
-                                        .weight(1f)
-                                        .height(48.dp)
-                                        .padding(horizontal = 16.dp),
-                                    verticalAlignment = Alignment.CenterVertically
-                                ) {
-                                    Box(
-                                        modifier = Modifier
-                                            .size(10.dp)
-                                            .background(VibeError, CircleShape)
-                                    )
-                                    Spacer(modifier = Modifier.width(8.dp))
-                                    Text(
-                                        text = String.format("%02d:%02d", (recordingDuration / 1000) / 60, (recordingDuration / 1000) % 60),
-                                        color = VibeError,
-                                        fontSize = 16.sp,
-                                        fontWeight = FontWeight.Bold
-                                    )
-                                    Spacer(modifier = Modifier.weight(1f))
-                                    
-                                    if (isLocked) {
-                                        TextButton(onClick = {
-                                            val file = recorderHelper.stopRecording()
-                                            file?.delete()
-                                            isLocked = false
-                                            dragOffset = 0f
-                                            dragOffsetY = 0f
-                                        }) {
-                                            Text("Отмена", color = VibeError, fontSize = 14.sp)
-                                        }
-                                    } else {
-                                        Text(
-                                            text = "< " + strings.logoutCancel, // Reusing string or just hardcode "Swipe to cancel" for now
-                                            fontSize = 14.sp,
-                                            color = androidx.compose.material3.MaterialTheme.colorScheme.onBackground.copy(alpha = 0.5f)
-                                        )
-                                    }
-                                }
-                            } else {
-                                BasicTextField(
-                                    value = inputTextFieldValue,
-                                    onValueChange = { newValue ->
-                                        if (newValue.text.length <= 2048) {
-                                            inputTextFieldValue = newValue
-                                            viewModel.onTextChanged(newValue.text)
-                                        } else {
-                                            val trimmed = newValue.text.take(2048)
-                                            inputTextFieldValue = newValue.copy(text = trimmed, selection = androidx.compose.ui.text.TextRange(trimmed.length))
-                                            viewModel.onTextChanged(trimmed)
-                                        }
-                                    },
-                                    textStyle = TextStyle(
-                                        color = androidx.compose.material3.MaterialTheme.colorScheme.onBackground,
-                                        fontSize = 16.sp,
-                                        letterSpacing = (-0.2).sp
-                                    ),
-                                    cursorBrush = SolidColor(VibePrimary),
-                                    modifier = Modifier
-                                        .weight(1f)
-                                        .heightIn(min = 36.dp, max = 120.dp)
-                                        .padding(horizontal = 16.dp, vertical = 8.dp),
-                                    decorationBox = { innerTextField ->
-                                        if (inputTextFieldValue.text.isEmpty()) {
-                                            Text(
-                                                text = strings.messagePlaceholder,
-                                                color = androidx.compose.material3.MaterialTheme.colorScheme.onBackground.copy(alpha = 0.4f),
-                                                fontSize = 16.sp,
-                                                letterSpacing = (-0.2).sp
-                                            )
-                                        }
-                                        innerTextField()
-                                    }
-                                )
-                            }
-                            
-                            Spacer(modifier = Modifier.width(8.dp))
-
-                            Box(contentAlignment = Alignment.Center) {
-                                Box(
-                                    modifier = Modifier
-                                        .size(40.dp)
-                                        .pointerInput(canSendTextOrPhoto) {
-                                            awaitEachGesture {
-                                                val down = awaitFirstDown(requireUnconsumed = false)
-                                                
-                                                if (canSendTextOrPhoto) {
-                                                    // Simple tap → send text/photo/edit
-                                                    down.consume()
-                                                    if (editingMessage != null) {
-                                                        viewModel.submitEditMessage(inputTextFieldValue.text)
-                                                    } else if (pendingPhotos.isNotEmpty() || pendingFiles.isNotEmpty()) {
-                                                        val allUris = pendingPhotos + pendingFiles
-                                                        viewModel.sendPhotos(context, allUris, inputTextFieldValue.text)
-                                                        pendingPhotos = emptyList()
-                                                        pendingFiles = emptyList()
-                                                    } else {
-                                                        val text = inputTextFieldValue.text
-                                                        if (text.isNotBlank()) {
-                                                            viewModel.sendMessage(text)
-                                                        }
-                                                    }
-                                                    inputTextFieldValue = TextFieldValue("")
-                                                    viewModel.onTextChanged("")
-                                                    return@awaitEachGesture
-                                                }
-                                                
-                                                if (isLocked) {
-                                                    // Locked mode: tap to send voice
-                                                    down.consume()
-                                                    val file = recorderHelper.stopRecording()
-                                                    if (file != null && recordingDuration > 500) {
-                                                        viewModel.sendVoiceMessage(context, file, recordingDuration)
-                                                    } else {
-                                                        file?.delete()
-                                                    }
-                                                    isLocked = false
-                                                    dragOffset = 0f
-                                                    dragOffsetY = 0f
-                                                    return@awaitEachGesture
-                                                }
-                                                
-                                                // Not canSend, not locked → long-press to record
-                                                var longPressTriggered = false
-                                                var cancelled = false
-                                                val touchSlop = viewConfiguration.touchSlop
-                                                
-                                                val upEvent = withTimeoutOrNull(viewConfiguration.longPressTimeoutMillis) {
-                                                    var currentEvent: androidx.compose.ui.input.pointer.PointerEvent
-                                                    var distance = 0f
-                                                    do {
-                                                        currentEvent = awaitPointerEvent()
-                                                        val ptr = currentEvent.changes.firstOrNull { it.id == down.id }
-                                                        if (ptr != null) {
-                                                            distance += ptr.positionChange().getDistance()
-                                                        }
-                                                        if (distance > touchSlop) {
-                                                            return@withTimeoutOrNull currentEvent
-                                                        }
-                                                    } while (currentEvent.changes.any { it.pressed })
-                                                    currentEvent
-                                                }
-                                                
-                                                if (upEvent == null) {
-                                                    // Timeout reached without lifting -> Long Press!
-                                                    longPressTriggered = true
-                                                    if (androidx.core.content.ContextCompat.checkSelfPermission(context, android.Manifest.permission.RECORD_AUDIO) == android.content.pm.PackageManager.PERMISSION_GRANTED) {
-                                                        recorderHelper.startRecording()
-                                                    } else {
-                                                        recordAudioPermissionLauncher.launch(android.Manifest.permission.RECORD_AUDIO)
-                                                        return@awaitEachGesture
-                                                    }
-                                                    
-                                                    // Now track drag until UP
-                                                    while (true) {
-                                                        val event = awaitPointerEvent()
-                                                        val pointer = event.changes.firstOrNull { it.id == down.id } ?: break
-                                                        
-                                                        if (!pointer.pressed) {
-                                                            pointer.consume()
-                                                            break
-                                                        }
-                                                        
-                                                        val posChange = pointer.positionChange()
-                                                        dragOffset += posChange.x
-                                                        dragOffsetY += posChange.y
-                                                        
-                                                        // Swipe left to cancel (> 100dp approx)
-                                                        if (dragOffset < -300f) {
-                                                            cancelled = true
-                                                            val file = recorderHelper.stopRecording()
-                                                            file?.delete()
-                                                            dragOffset = 0f
-                                                            dragOffsetY = 0f
-                                                            break
-                                                        }
-                                                        
-                                                        // Swipe UP to lock (> 80dp approx)
-                                                        if (dragOffsetY < -200f && !isLocked) {
-                                                            isLocked = true
-                                                            dragOffset = 0f
-                                                            dragOffsetY = 0f
-                                                        }
-                                                    }
-                                                    
-                                                    if (!cancelled && !isLocked) {
-                                                        val file = recorderHelper.stopRecording()
-                                                        if (file != null && recordingDuration > 500) {
-                                                            viewModel.sendVoiceMessage(context, file, recordingDuration)
-                                                        } else {
-                                                            file?.delete()
-                                                        }
-                                                        dragOffset = 0f
-                                                        dragOffsetY = 0f
-                                                    }
-                                                } else {
-                                                    // Released before long press timeout -> do nothing
-                                                }
-                                            }
-                                        }
-                                        .clip(CircleShape)
-                                        .background(VibePrimary),
-                                    contentAlignment = Alignment.Center
-                                ) {
-                                    Icon(
-                                        imageVector = if (canSendTextOrPhoto || isLocked) Icons.AutoMirrored.Filled.Send else Icons.Default.Mic,
-                                        contentDescription = if (canSendTextOrPhoto || isLocked) strings.sendBtn else "Record Voice",
-                                        tint = Color.White,
-                                        modifier = Modifier.size(24.dp)
-                                    )
-                                }
-                            }
-                        }
-                    } else {
-                        Box(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(16.dp),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            Text(
-                                text = strings.userRestrictedMessaging,
-                                color = androidx.compose.material3.MaterialTheme.colorScheme.onBackground.copy(alpha = 0.5f),
-                                fontSize = 14.sp
-                            )
-                        }
-                    }
-                }
-            }
-            }
-        }
-        
-        // Emoji / Sticker / GIF panel is now inline (rendered in the Column above the input bar).
-
-        // Attachment ModalBottomSheet (redesigned)
-        if (showAttachmentMenu) {
-            val attachSheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
-            ModalBottomSheet(
-                onDismissRequest = { showAttachmentMenu = false },
-                sheetState = attachSheetState,
-                containerColor = androidx.compose.material3.MaterialTheme.colorScheme.surface,
-                shape = RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp)
-            ) {
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(bottom = 32.dp, top = 8.dp, start = 16.dp, end = 16.dp)
-                ) {
-                    Text(
-                        text = strings.attachTitle,
-                        fontSize = 18.sp,
-                        fontWeight = FontWeight.Bold,
-                        color = androidx.compose.material3.MaterialTheme.colorScheme.onSurface,
-                        modifier = Modifier.padding(bottom = 12.dp)
-                    )
-                    
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clip(RoundedCornerShape(16.dp))
-                            .background(androidx.compose.material3.MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f))
-                            .clickable {
-                                showAttachmentMenu = false
-                                photoPickerLauncher.launch(
-                                    androidx.activity.result.PickVisualMediaRequest(
-                                        androidx.activity.result.contract.ActivityResultContracts.PickVisualMedia.ImageAndVideo
-                                    )
-                                )
-                            }
-                            .padding(12.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Box(
-                            modifier = Modifier
-                                .size(40.dp)
-                                .clip(RoundedCornerShape(12.dp))
-                                .background(VibePrimary.copy(alpha = 0.15f)),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            Icon(Icons.Default.Image, contentDescription = null, tint = VibePrimary, modifier = Modifier.size(22.dp))
-                        }
-                        Spacer(modifier = Modifier.width(16.dp))
-                        Column {
-                            Text(strings.attachPhotoVideo, fontSize = 16.sp, fontWeight = FontWeight.SemiBold, color = androidx.compose.material3.MaterialTheme.colorScheme.onSurface)
-                            Text("JPG, PNG, MP4, MOV...", fontSize = 12.sp, color = androidx.compose.material3.MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f))
-                        }
-                    }
-                    
-                    Spacer(modifier = Modifier.height(4.dp))
-                    
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clip(RoundedCornerShape(16.dp))
-                            .background(androidx.compose.material3.MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f))
-                            .clickable {
-                                showAttachmentMenu = false
-                                documentPickerLauncher.launch(arrayOf("*/*"))
-                            }
-                            .padding(12.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Box(
-                            modifier = Modifier
-                                .size(40.dp)
-                                .clip(RoundedCornerShape(12.dp))
-                                .background(VibeWarning.copy(alpha = 0.15f)),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            Icon(Icons.Default.InsertDriveFile, contentDescription = null, tint = VibeWarning, modifier = Modifier.size(22.dp))
-                        }
-                        Spacer(modifier = Modifier.width(16.dp))
-                        Column {
-                            Text(strings.attachFile, fontSize = 16.sp, fontWeight = FontWeight.SemiBold, color = androidx.compose.material3.MaterialTheme.colorScheme.onSurface)
-                            Text("PDF, DOC, ZIP...", fontSize = 12.sp, color = androidx.compose.material3.MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f))
-                        }
-                    }
-                }
-            }
-        }
-        
-        // Link insertion dialog
-        if (showLinkInputDialog) {
-            var linkText by remember(showLinkInputDialog) { mutableStateOf(linkInputInitialText) }
-            var linkUrl by remember(showLinkInputDialog) { mutableStateOf("") }
-            AlertDialog(
-                onDismissRequest = { showLinkInputDialog = false },
-                title = { Text(strings.formatLink, fontWeight = FontWeight.Bold) },
-                text = {
-                    Column {
-                        OutlinedTextField(
-                            value = linkText,
-                            onValueChange = { linkText = it },
-                            label = { Text("Текст ссылки") },
-                            singleLine = true,
-                            colors = OutlinedTextFieldDefaults.colors(focusedBorderColor = VibePrimary, cursorColor = VibePrimary)
-                        )
-                        Spacer(modifier = Modifier.height(8.dp))
-                        OutlinedTextField(
-                            value = linkUrl,
-                            onValueChange = { linkUrl = it },
-                            label = { Text(strings.formatLinkUrlHint) },
-                            singleLine = true,
-                            colors = OutlinedTextFieldDefaults.colors(focusedBorderColor = VibePrimary, cursorColor = VibePrimary)
-                        )
-                    }
-                },
-                confirmButton = {
-                    TextButton(onClick = {
-                        if (linkText.isNotBlank() && linkUrl.isNotBlank()) {
-                            val start = minOf(linkInputSelection.start, linkInputSelection.end).coerceIn(0, inputTextFieldValue.text.length)
-                            val end = maxOf(linkInputSelection.start, linkInputSelection.end).coerceIn(0, inputTextFieldValue.text.length)
-                            val prefix = inputTextFieldValue.text.substring(0, start)
-                            val suffix = inputTextFieldValue.text.substring(end)
-                            val formattedLink = "[$linkText]($linkUrl)"
-                            val newText = prefix + formattedLink + suffix
-                            val newCursor = start + formattedLink.length
-                            inputTextFieldValue = TextFieldValue(newText, TextRange(newCursor))
-                        }
-                        showLinkInputDialog = false
-                    }) {
-                        Text("OK", color = VibePrimary, fontWeight = FontWeight.Bold)
-                    }
-                },
-                dismissButton = {
-                    TextButton(onClick = { showLinkInputDialog = false }) {
-                        Text(strings.cancelBtn, color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f))
-                    }
-                }
-            )
-        }
-
-        // Color text dialog
-        if (showColorInputDialog) {
-            var colorHex by remember(showColorInputDialog) { mutableStateOf("#FF5733") }
-            var colorText by remember(showColorInputDialog) { mutableStateOf(colorInputInitialText) }
-            AlertDialog(
-                onDismissRequest = { showColorInputDialog = false },
-                title = { Text(strings.formatTextColor, fontWeight = FontWeight.Bold) },
-                text = {
-                    Column {
-                        OutlinedTextField(
-                            value = colorText,
-                            onValueChange = { colorText = it },
-                            label = { Text("Текст") },
-                            singleLine = true,
-                            colors = OutlinedTextFieldDefaults.colors(focusedBorderColor = VibePrimary, cursorColor = VibePrimary)
-                        )
-                        Spacer(modifier = Modifier.height(8.dp))
-                        OutlinedTextField(
-                            value = colorHex,
-                            onValueChange = { colorHex = it },
-                            label = { Text(strings.formatColorHint) },
-                            singleLine = true,
-                            colors = OutlinedTextFieldDefaults.colors(focusedBorderColor = VibePrimary, cursorColor = VibePrimary)
-                        )
-                        Spacer(modifier = Modifier.height(8.dp))
-                        val previewColor = try {
-                            Color(android.graphics.Color.parseColor(colorHex))
-                        } catch (_: Exception) { Color.Gray }
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Text(strings.formatPreview + ": ", fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f))
-                            Box(modifier = Modifier.size(20.dp).clip(RoundedCornerShape(4.dp)).background(previewColor))
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Text(colorText.ifEmpty { "Text" }, color = previewColor, fontWeight = FontWeight.SemiBold)
-                        }
-                    }
-                },
-                confirmButton = {
-                    TextButton(onClick = {
-                        if (colorText.isNotBlank() && colorHex.startsWith("#")) {
-                            val start = minOf(colorInputSelection.start, colorInputSelection.end).coerceIn(0, inputTextFieldValue.text.length)
-                            val end = maxOf(colorInputSelection.start, colorInputSelection.end).coerceIn(0, inputTextFieldValue.text.length)
-                            val prefix = inputTextFieldValue.text.substring(0, start)
-                            val suffix = inputTextFieldValue.text.substring(end)
-                            val formattedColor = "{{$colorHex:$colorText}}"
-                            val newText = prefix + formattedColor + suffix
-                            val newCursor = start + formattedColor.length
-                            inputTextFieldValue = TextFieldValue(newText, TextRange(newCursor))
-                        }
-                        showColorInputDialog = false
-                    }) {
-                        Text("OK", color = VibePrimary, fontWeight = FontWeight.Bold)
-                    }
-                },
-                dismissButton = {
-                    TextButton(onClick = { showColorInputDialog = false }) {
-                        Text(strings.cancelBtn, color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f))
-                    }
-                }
+                    .blur(inputBarBlur),
+                viewModel = viewModel,
+                webSocket = webSocket,
+                strings = strings,
+                hazeState = hazeState,
+                liquidState = liquidState,
+                displayName = displayName,
+                canMessage = effectiveUser?.canMessage != false,
+                isBlockedByMe = isBlockedByMe,
+                interlocutorId = interlocutorId,
+                inputState = inputState,
+                layoutState = layoutState,
+                toast = toast,
+                onAttachMenuOpenChange = { isAttachMenuOpen = it }
             )
         }
 
         if (showDeleteDialog) {
-            val anyMine = selectedMessages.any { id -> messages.find { it.id == id }?.senderId == viewModel.myUserId }
-            val allMine = selectedMessages.all { id -> messages.find { it.id == id }?.senderId == viewModel.myUserId }
+            val anyMine = selection.ids.any { id -> messages.find { it.id == id }?.senderId == viewModel.myUserId }
+            val allMine = selection.ids.all { id -> messages.find { it.id == id }?.senderId == viewModel.myUserId }
             var deleteForEveryone by remember { mutableStateOf(false) }
 
             AlertDialog(
-                onDismissRequest = { showDeleteDialog = false },
+                onDismissRequest = {
+                    showDeleteDialog = false
+                    releaseTransientSelection()
+                },
                 title = { Text(text = strings.deleteMessagesTitle, fontWeight = FontWeight.Bold) },
                 text = {
                     Column {
-                        Text(text = strings.deleteMessagesText(selectedMessages.size))
+                        Text(text = strings.deleteMessagesText(selection.ids.size))
                         if (anyMine) {
                             Spacer(modifier = Modifier.height(16.dp))
                             Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.clickable { deleteForEveryone = !deleteForEveryone }) {
@@ -2079,15 +632,19 @@ fun ChatScreen(
                 },
                 confirmButton = {
                     TextButton(onClick = {
-                        viewModel.deleteMessages(selectedMessages.toList(), deleteForEveryone)
-                        selectedMessages.clear()
+                        viewModel.deleteMessages(selection.ids.toList(), deleteForEveryone)
+                        selection.ids.clear()
+                        transientSelection = false
                         showDeleteDialog = false
                     }) {
                         Text(strings.deleteBtn, color = VibeError, fontWeight = FontWeight.Bold)
                     }
                 },
                 dismissButton = {
-                    TextButton(onClick = { showDeleteDialog = false }) {
+                    TextButton(onClick = {
+                        showDeleteDialog = false
+                        releaseTransientSelection()
+                    }) {
                         Text(strings.cancelBtn, color = VibePrimary)
                     }
                 },
@@ -2102,7 +659,10 @@ fun ChatScreen(
         if (showForwardSheet) {
             val recentChats by viewModel.recentChats.collectAsState()
             ModalBottomSheet(
-                onDismissRequest = { showForwardSheet = false },
+                onDismissRequest = {
+                    showForwardSheet = false
+                    releaseTransientSelection()
+                },
                 sheetState = forwardSheetState,
                 containerColor = androidx.compose.material3.MaterialTheme.colorScheme.surface,
                 shape = RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp)
@@ -2119,7 +679,7 @@ fun ChatScreen(
                         fontWeight = FontWeight.Bold,
                         modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
                     )
-                    
+
                     androidx.compose.material3.OutlinedTextField(
                         value = forwardSearchQuery,
                         onValueChange = { forwardSearchQuery = it },
@@ -2133,17 +693,17 @@ fun ChatScreen(
                         ),
                         shape = RoundedCornerShape(12.dp)
                     )
-                    
+
                     Spacer(modifier = Modifier.height(8.dp))
-                    
+
                     val filteredChats = if (forwardSearchQuery.isBlank()) {
                         recentChats
                     } else {
                         recentChats.filter {
                             val name = it.name ?: ""
                             val username = it.username ?: ""
-                            name.contains(forwardSearchQuery, ignoreCase = true) || 
-                            username.contains(forwardSearchQuery, ignoreCase = true)
+                            name.contains(forwardSearchQuery, ignoreCase = true) ||
+                                    username.contains(forwardSearchQuery, ignoreCase = true)
                         }
                     }
 
@@ -2170,8 +730,9 @@ fun ChatScreen(
                                     modifier = Modifier
                                         .fillMaxWidth()
                                         .clickable {
-                                            viewModel.forwardMessages(chatUser.chat.interlocutorId, selectedMessages.toList())
-                                            selectedMessages.clear()
+                                            viewModel.forwardMessages(chatUser.chat.interlocutorId, selection.ids.toList())
+                                            selection.ids.clear()
+                                            transientSelection = false
                                             showForwardSheet = false
                                             forwardSearchQuery = ""
                                             scope.launch { forwardSheetState.hide() }
@@ -2229,11 +790,11 @@ fun ChatScreen(
                                                 badgeSize = 14.dp
                                             )
                                         }
-                                        
+
                                         val statusText = if (isBlocked) {
                                             strings.lastSeenLongAgo
                                         } else if (isBlockedByMe) {
-                                            "Заблокирован"
+                                            strings.chatStatusBlockedByMe
                                         } else if (chatUser.isBot == true) {
                                             strings.statusBot
                                         } else if (isOnline) {
@@ -2241,12 +802,12 @@ fun ChatScreen(
                                         } else {
                                             formatLastSeen(chatUser.lastSeen, strings)
                                         }
-                                        
+
                                         Text(
                                             text = statusText,
-                                            color = if (isBlockedByMe) com.flasskdev.vibe.ui.theme.VibeError 
-                                                else if (isOnline) com.flasskdev.vibe.ui.theme.VibeOnlineGreen 
-                                                else androidx.compose.material3.MaterialTheme.colorScheme.onBackground.copy(alpha = 0.5f),
+                                            color = if (isBlockedByMe) com.flasskdev.vibe.ui.theme.VibeError
+                                            else if (isOnline) com.flasskdev.vibe.ui.theme.VibeOnlineGreen
+                                            else androidx.compose.material3.MaterialTheme.colorScheme.onBackground.copy(alpha = 0.5f),
                                             fontSize = 13.sp,
                                             maxLines = 1,
                                             overflow = TextOverflow.Ellipsis
@@ -2260,311 +821,312 @@ fun ChatScreen(
             }
         }
 
-    if (messageToPin != null) {
-        AlertDialog(
-            onDismissRequest = { messageToPin = null },
-            title = { Text(strings.pinMessage ?: "Закрепить сообщение") },
-            text = {
-                Column {
-                    Text(strings.pinMessageConfirm ?: "Вы действительно хотите закрепить это сообщение?")
-                    Spacer(modifier = Modifier.height(16.dp))
-                    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.clickable { unpinForBoth = !unpinForBoth }) {
-                        Checkbox(checked = unpinForBoth, onCheckedChange = { unpinForBoth = it })
-                        Text(strings.forBoth(displayName) ?: "Также для $displayName")
+        if (messageToPin != null) {
+            AlertDialog(
+                onDismissRequest = { messageToPin = null },
+                title = { Text(strings.pinMessage) },
+                text = {
+                    Column {
+                        Text(strings.pinMessageConfirm)
+                        Spacer(modifier = Modifier.height(16.dp))
+                        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.clickable { unpinForBoth = !unpinForBoth }) {
+                            Checkbox(checked = unpinForBoth, onCheckedChange = { unpinForBoth = it })
+                            Text(strings.forBoth(displayName))
+                        }
+                    }
+                },
+                confirmButton = {
+                    TextButton(onClick = {
+                        viewModel.pinMessage(messageToPin!!.id, unpinForBoth)
+                        messageToPin = null
+                    }) {
+                        Text(strings.pin)
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = { messageToPin = null }) {
+                        Text(strings.cancelBtn)
                     }
                 }
-            },
-            confirmButton = {
-                TextButton(onClick = {
-                    viewModel.pinMessage(messageToPin!!.id, unpinForBoth)
-                    messageToPin = null
-                }) {
-                    Text(strings.pin ?: "Закрепить")
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = { messageToPin = null }) {
-                    Text(strings.cancelBtn)
-                }
-            }
-        )
-    }
-
-    if (messageToUnpin != null) {
-        AlertDialog(
-            onDismissRequest = { messageToUnpin = null },
-            title = { Text(strings.unpinMessage ?: "Открепить сообщение") },
-            text = {
-                Column {
-                    Text(strings.unpinMessageConfirm ?: "Вы действительно хотите открепить это сообщение?")
-                    Spacer(modifier = Modifier.height(16.dp))
-                    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.clickable { unpinForBoth = !unpinForBoth }) {
-                        Checkbox(checked = unpinForBoth, onCheckedChange = { unpinForBoth = it })
-                        Text(strings.forBoth(displayName) ?: "Также для $displayName")
-                    }
-                }
-            },
-            confirmButton = {
-                TextButton(onClick = {
-                    viewModel.unpinMessage(messageToUnpin!!.id, unpinForBoth)
-                    messageToUnpin = null
-                }) {
-                    Text(strings.unpin ?: "Открепить")
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = { messageToUnpin = null }) {
-                    Text(strings.cancelBtn)
-                }
-            }
-        )
-    }
-
-    if (showUnpinAllDialog) {
-        AlertDialog(
-            onDismissRequest = { showUnpinAllDialog = false },
-            title = { Text(strings.unpinAll ?: "Открепить все") },
-            text = {
-                Column {
-                    Text(strings.unpinAllConfirm ?: "Открепить все сообщения в этом чате?")
-                    Spacer(modifier = Modifier.height(16.dp))
-                    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.clickable { unpinForBoth = !unpinForBoth }) {
-                        Checkbox(checked = unpinForBoth, onCheckedChange = { unpinForBoth = it })
-                        Text(strings.forBoth(displayName) ?: "Также для $displayName")
-                    }
-                }
-            },
-            confirmButton = {
-                TextButton(onClick = {
-                    viewModel.unpinAllMessages(unpinForBoth)
-                    showUnpinAllDialog = false
-                    showPinnedMessagesModal = false
-                }) {
-                    Text(strings.unpin ?: "Открепить")
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = { showUnpinAllDialog = false }) {
-                    Text(strings.cancelBtn)
-                }
-            }
-        )
-    }
-    
-    if (viewingMessage != null) {
-        val attachments = viewingMessage!!.attachments ?: emptyList()
-        if (attachments.isNotEmpty()) {
-            val pagerState = androidx.compose.foundation.pager.rememberPagerState(
-                initialPage = viewingPhotoIndex,
-                pageCount = { attachments.size }
             )
-            
-            val msgTime = remember(viewingMessage!!.timestamp) {
-                java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault()).format(java.util.Date(viewingMessage!!.timestamp))
-            }
-            val senderN = if (viewingMessage!!.senderId == viewModel.myUserId) strings.you ?: "Вы" else displayName
-            
-            var isZoomed by remember { mutableStateOf(false) }
+        }
 
-            androidx.compose.ui.window.Dialog(
-                onDismissRequest = { viewingMessage = null },
-                properties = androidx.compose.ui.window.DialogProperties(
-                    usePlatformDefaultWidth = false,
-                    decorFitsSystemWindows = false,
-                    dismissOnBackPress = true
+        if (messageToUnpin != null) {
+            AlertDialog(
+                onDismissRequest = { messageToUnpin = null },
+                title = { Text(strings.unpinMessage) },
+                text = {
+                    Column {
+                        Text(strings.unpinMessageConfirm)
+                        Spacer(modifier = Modifier.height(16.dp))
+                        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.clickable { unpinForBoth = !unpinForBoth }) {
+                            Checkbox(checked = unpinForBoth, onCheckedChange = { unpinForBoth = it })
+                            Text(strings.forBoth(displayName))
+                        }
+                    }
+                },
+                confirmButton = {
+                    TextButton(onClick = {
+                        viewModel.unpinMessage(messageToUnpin!!.id, unpinForBoth)
+                        messageToUnpin = null
+                    }) {
+                        Text(strings.unpin)
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = { messageToUnpin = null }) {
+                        Text(strings.cancelBtn)
+                    }
+                }
+            )
+        }
+
+        if (showUnpinAllDialog) {
+            AlertDialog(
+                onDismissRequest = { showUnpinAllDialog = false },
+                title = { Text(strings.unpinAll) },
+                text = {
+                    Column {
+                        Text(strings.unpinAllConfirm)
+                        Spacer(modifier = Modifier.height(16.dp))
+                        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.clickable { unpinForBoth = !unpinForBoth }) {
+                            Checkbox(checked = unpinForBoth, onCheckedChange = { unpinForBoth = it })
+                            Text(strings.forBoth(displayName))
+                        }
+                    }
+                },
+                confirmButton = {
+                    TextButton(onClick = {
+                        viewModel.unpinAllMessages(unpinForBoth)
+                        showUnpinAllDialog = false
+                        showPinnedMessagesModal = false
+                    }) {
+                        Text(strings.unpin)
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = { showUnpinAllDialog = false }) {
+                        Text(strings.cancelBtn)
+                    }
+                }
+            )
+        }
+
+        if (viewingMessage != null) {
+            val attachments = viewingMessage!!.attachments ?: emptyList()
+            if (attachments.isNotEmpty()) {
+                val pagerState = androidx.compose.foundation.pager.rememberPagerState(
+                    initialPage = viewingPhotoIndex,
+                    pageCount = { attachments.size }
                 )
-            ) {
-                Box(modifier = Modifier.fillMaxSize().background(Color.Black)) {
-                    androidx.compose.foundation.pager.HorizontalPager(
-                        state = pagerState,
-                        contentPadding = PaddingValues(horizontal = 24.dp),
-                        modifier = Modifier.fillMaxSize(),
-                        pageSpacing = 16.dp,
-                        userScrollEnabled = !isZoomed
-                    ) { page ->
-                        var targetZoomScale by remember { mutableFloatStateOf(1f) }
-                        var targetZoomOffsetX by remember { mutableFloatStateOf(0f) }
-                        var targetZoomOffsetY by remember { mutableFloatStateOf(0f) }
-                        var isPinching by remember { mutableStateOf(false) }
 
-                        val animatedZoomScale by androidx.compose.animation.core.animateFloatAsState(
-                            targetValue = targetZoomScale,
-                            animationSpec = if (isPinching) androidx.compose.animation.core.snap() else androidx.compose.animation.core.spring()
-                        )
-                        val animatedZoomOffsetX by androidx.compose.animation.core.animateFloatAsState(
-                            targetValue = targetZoomOffsetX,
-                            animationSpec = if (isPinching) androidx.compose.animation.core.snap() else androidx.compose.animation.core.spring()
-                        )
-                        val animatedZoomOffsetY by androidx.compose.animation.core.animateFloatAsState(
-                            targetValue = targetZoomOffsetY,
-                            animationSpec = if (isPinching) androidx.compose.animation.core.snap() else androidx.compose.animation.core.spring()
-                        )
+                val msgTime = remember(viewingMessage!!.timestamp) {
+                    java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault()).format(java.util.Date(viewingMessage!!.timestamp))
+                }
+                val senderN = if (viewingMessage!!.senderId == viewModel.myUserId) strings.you else displayName
 
-                        LaunchedEffect(animatedZoomScale) {
-                            if (page == pagerState.currentPage) {
-                                isZoomed = animatedZoomScale > 1f
-                            }
-                        }
+                var isZoomed by remember { mutableStateOf(false) }
 
-                        LaunchedEffect(pagerState.currentPage) {
-                            if (page != pagerState.currentPage) {
-                                targetZoomScale = 1f
-                                targetZoomOffsetX = 0f
-                                targetZoomOffsetY = 0f
-                            }
-                        }
+                androidx.compose.ui.window.Dialog(
+                    onDismissRequest = { viewingMessage = null },
+                    properties = androidx.compose.ui.window.DialogProperties(
+                        usePlatformDefaultWidth = false,
+                        decorFitsSystemWindows = false,
+                        dismissOnBackPress = true
+                    )
+                ) {
+                    Box(modifier = Modifier.fillMaxSize().background(Color.Black)) {
+                        androidx.compose.foundation.pager.HorizontalPager(
+                            state = pagerState,
+                            contentPadding = PaddingValues(horizontal = 24.dp),
+                            modifier = Modifier.fillMaxSize(),
+                            pageSpacing = 16.dp,
+                            userScrollEnabled = !isZoomed
+                        ) { page ->
+                            var targetZoomScale by remember { mutableFloatStateOf(1f) }
+                            var targetZoomOffsetX by remember { mutableFloatStateOf(0f) }
+                            var targetZoomOffsetY by remember { mutableFloatStateOf(0f) }
+                            var isPinching by remember { mutableStateOf(false) }
 
-                                                val attachmentPath = attachments[page]
-                        val isVideo = com.flasskdev.vibe.utils.AttachmentUtils.isPlayableVideo(attachmentPath)
-                        val isLocal = attachmentPath.startsWith("/") || attachmentPath.startsWith("content://") || attachmentPath.contains("cacheDir")
+                            val animatedZoomScale by androidx.compose.animation.core.animateFloatAsState(
+                                targetValue = targetZoomScale,
+                                animationSpec = if (isPinching) androidx.compose.animation.core.snap() else androidx.compose.animation.core.spring()
+                            )
+                            val animatedZoomOffsetX by androidx.compose.animation.core.animateFloatAsState(
+                                targetValue = targetZoomOffsetX,
+                                animationSpec = if (isPinching) androidx.compose.animation.core.snap() else androidx.compose.animation.core.spring()
+                            )
+                            val animatedZoomOffsetY by androidx.compose.animation.core.animateFloatAsState(
+                                targetValue = targetZoomOffsetY,
+                                animationSpec = if (isPinching) androidx.compose.animation.core.snap() else androidx.compose.animation.core.spring()
+                            )
 
-                        val model = if (isLocal) {
-                            java.io.File(attachmentPath)
-                        } else if (attachmentPath.startsWith("http")) {
-                            attachmentPath
-                        } else {
-                            "https://flasskdev.alwaysdata.net/api/upload/file/$attachmentPath"
-                        }
-                        
-                        val pageOffset = (pagerState.currentPage - page) + pagerState.currentPageOffsetFraction
-                        val diff = 1f - kotlin.math.abs(pageOffset).coerceIn(0f, 1f)
-                        val baseAlpha = 0.3f + 0.7f * diff
-                        val baseScale = 0.85f + 0.15f * diff
-                        
-                        var componentSize by remember { mutableStateOf(androidx.compose.ui.unit.IntSize.Zero) }
-                        
-                        Box(
-                            modifier = Modifier
-                                .fillMaxSize()
-                                .onSizeChanged { componentSize = it }
-                                .graphicsLayer {
-                                    this.alpha = baseAlpha
-                                    if (page == pagerState.currentPage) {
-                                        scaleX = baseScale * animatedZoomScale
-                                        scaleY = baseScale * animatedZoomScale
-                                        translationX = animatedZoomOffsetX
-                                        translationY = animatedZoomOffsetY
-                                    } else {
-                                        scaleX = baseScale
-                                        scaleY = baseScale
-                                    }
+                            LaunchedEffect(animatedZoomScale) {
+                                if (page == pagerState.currentPage) {
+                                    isZoomed = animatedZoomScale > 1f
                                 }
-                                .pointerInput(page == pagerState.currentPage) {
-                                                                        if (!isVideo && page == pagerState.currentPage) {
-                                        awaitEachGesture {
+                            }
 
-                                            awaitFirstDown(requireUnconsumed = false)
-                                            isPinching = true
-                                            do {
-                                                val event = awaitPointerEvent()
-                                                val zoom = event.calculateZoom()
-                                                val pan = event.calculatePan()
-                                                
-                                                if (targetZoomScale > 1f || event.changes.size > 1) {
-                                                    event.changes.forEach { it.consume() }
-                                                    targetZoomScale = (targetZoomScale * zoom).coerceIn(1f, 5f)
-                                                    
-                                                    if (targetZoomScale > 1f) {
-                                                        val maxX = (targetZoomScale - 1) * componentSize.width / 2
-                                                        val maxY = (targetZoomScale - 1) * componentSize.height / 2
-                                                        targetZoomOffsetX = (targetZoomOffsetX + pan.x * 2.5f).coerceIn(-maxX, maxX)
-                                                        targetZoomOffsetY = (targetZoomOffsetY + pan.y * 2.5f).coerceIn(-maxY, maxY)
-                                                    } else {
-                                                        targetZoomOffsetX = 0f
-                                                        targetZoomOffsetY = 0f
-                                                    }
-                                                }
-                                            } while (event.changes.any { it.pressed })
-                                            isPinching = false
+                            LaunchedEffect(pagerState.currentPage) {
+                                if (page != pagerState.currentPage) {
+                                    targetZoomScale = 1f
+                                    targetZoomOffsetX = 0f
+                                    targetZoomOffsetY = 0f
+                                }
+                            }
+
+                            val attachmentPath = attachments[page]
+                            val isVideo = com.flasskdev.vibe.utils.AttachmentUtils.isPlayableVideo(attachmentPath)
+                            val isLocal = attachmentPath.startsWith("/") || attachmentPath.startsWith("content://") || attachmentPath.contains("cacheDir")
+
+                            val model = if (isLocal) {
+                                java.io.File(attachmentPath)
+                            } else if (attachmentPath.startsWith("http")) {
+                                attachmentPath
+                            } else {
+                                "https://flasskdev.alwaysdata.net/api/upload/file/$attachmentPath"
+                            }
+
+                            val pageOffset = (pagerState.currentPage - page) + pagerState.currentPageOffsetFraction
+                            val diff = 1f - kotlin.math.abs(pageOffset).coerceIn(0f, 1f)
+                            val baseAlpha = 0.3f + 0.7f * diff
+                            val baseScale = 0.85f + 0.15f * diff
+
+                            var componentSize by remember { mutableStateOf(androidx.compose.ui.unit.IntSize.Zero) }
+
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .onSizeChanged { componentSize = it }
+                                    .graphicsLayer {
+                                        this.alpha = baseAlpha
+                                        if (page == pagerState.currentPage) {
+                                            scaleX = baseScale * animatedZoomScale
+                                            scaleY = baseScale * animatedZoomScale
+                                            translationX = animatedZoomOffsetX
+                                            translationY = animatedZoomOffsetY
+                                        } else {
+                                            scaleX = baseScale
+                                            scaleY = baseScale
                                         }
                                     }
-                                }
-                                .pointerInput(page == pagerState.currentPage) {
-                                                                        if (!isVideo && page == pagerState.currentPage) {
-                                        detectTapGestures(
+                                    .pointerInput(page == pagerState.currentPage) {
+                                        if (!isVideo && page == pagerState.currentPage) {
+                                            awaitEachGesture {
 
-                                            onDoubleTap = {
+                                                awaitFirstDown(requireUnconsumed = false)
+                                                isPinching = true
+                                                do {
+                                                    val event = awaitPointerEvent()
+                                                    val zoom = event.calculateZoom()
+                                                    val pan = event.calculatePan()
+
+                                                    if (targetZoomScale > 1f || event.changes.size > 1) {
+                                                        event.changes.forEach { it.consume() }
+                                                        targetZoomScale = (targetZoomScale * zoom).coerceIn(1f, 5f)
+
+                                                        if (targetZoomScale > 1f) {
+                                                            val maxX = (targetZoomScale - 1) * componentSize.width / 2
+                                                            val maxY = (targetZoomScale - 1) * componentSize.height / 2
+                                                            targetZoomOffsetX = (targetZoomOffsetX + pan.x * 2.5f).coerceIn(-maxX, maxX)
+                                                            targetZoomOffsetY = (targetZoomOffsetY + pan.y * 2.5f).coerceIn(-maxY, maxY)
+                                                        } else {
+                                                            targetZoomOffsetX = 0f
+                                                            targetZoomOffsetY = 0f
+                                                        }
+                                                    }
+                                                } while (event.changes.any { it.pressed })
                                                 isPinching = false
-                                                if (targetZoomScale > 1f) {
-                                                    targetZoomScale = 1f
-                                                    targetZoomOffsetX = 0f
-                                                    targetZoomOffsetY = 0f
-                                                } else {
-                                                    targetZoomScale = 2.5f
-                                                }
                                             }
-                                        )
+                                        }
                                     }
-                                },
-                            contentAlignment = Alignment.Center
-                        ) {
-                            if (isVideo) {
-                                com.flasskdev.vibe.ui.components.InlineVideoPlayer(
-                                    attachmentPath = attachmentPath,
-                                    onClose = { viewingMessage = null },
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .fillMaxHeight(0.8f)
-                                        .clip(RoundedCornerShape(8.dp))
-                                )
-                            } else {
-                                AsyncImage(
-                                    model = ImageRequest.Builder(LocalContext.current)
-                                        .data(model)
-                                        .crossfade(true)
-                                        .build(),
-                                    contentDescription = "Photo view",
-                                    modifier = Modifier.fillMaxWidth().fillMaxHeight(0.8f).clip(RoundedCornerShape(8.dp)),
-                                    contentScale = ContentScale.Fit
-                                )
-                            }
+                                    .pointerInput(page == pagerState.currentPage) {
+                                        if (!isVideo && page == pagerState.currentPage) {
+                                            detectTapGestures(
 
+                                                onDoubleTap = {
+                                                    isPinching = false
+                                                    if (targetZoomScale > 1f) {
+                                                        targetZoomScale = 1f
+                                                        targetZoomOffsetX = 0f
+                                                        targetZoomOffsetY = 0f
+                                                    } else {
+                                                        targetZoomScale = 2.5f
+                                                    }
+                                                }
+                                            )
+                                        }
+                                    },
+                                contentAlignment = Alignment.Center
+                            ) {
+                                if (isVideo) {
+                                    com.flasskdev.vibe.ui.components.InlineVideoPlayer(
+                                        attachmentPath = attachmentPath,
+                                        onClose = { viewingMessage = null },
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .fillMaxHeight(0.8f)
+                                            .clip(RoundedCornerShape(8.dp))
+                                    )
+                                } else {
+                                    AsyncImage(
+                                        model = ImageRequest.Builder(LocalContext.current)
+                                            .data(model)
+                                            .crossfade(true)
+                                            .build(),
+                                        contentDescription = "Photo view",
+                                        modifier = Modifier.fillMaxWidth().fillMaxHeight(0.8f).clip(RoundedCornerShape(8.dp)),
+                                        contentScale = ContentScale.Fit
+                                    )
+                                }
+
+                            }
                         }
-                    }
-                    
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .background(androidx.compose.ui.graphics.Brush.verticalGradient(
-                                colors = listOf(Color.Black.copy(alpha = 0.7f), Color.Transparent)
-                            ))
-                            .padding(top = 40.dp, bottom = 24.dp, start = 8.dp, end = 16.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        IconButton(onClick = { viewingMessage = null }) {
-                            Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back", tint = Color.White)
-                        }
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Column {
-                            Text(text = senderN, color = Color.White, fontWeight = FontWeight.Bold, fontSize = 16.sp)
-                            Text(text = msgTime, color = Color.White.copy(alpha = 0.7f), fontSize = 12.sp)
-                        }
-                    }
-                    
-                    if (viewingMessage!!.content.isNotBlank()) {
-                        Box(
+
+                        Row(
                             modifier = Modifier
-                                .align(Alignment.BottomCenter)
                                 .fillMaxWidth()
                                 .background(androidx.compose.ui.graphics.Brush.verticalGradient(
-                                    colors = listOf(Color.Transparent, Color.Black.copy(alpha = 0.8f))
+                                    colors = listOf(Color.Black.copy(alpha = 0.7f), Color.Transparent)
                                 ))
-                                .padding(start = 24.dp, end = 24.dp, top = 24.dp, bottom = 48.dp)
+                                .padding(top = 40.dp, bottom = 24.dp, start = 8.dp, end = 16.dp),
+                            verticalAlignment = Alignment.CenterVertically
                         ) {
-                            if (com.flasskdev.vibe.utils.TextFormatting.hasFormatting(viewingMessage!!.content)) {
-                                FormattedText(
-                                    text = viewingMessage!!.content,
-                                    baseColor = Color.White,
-                                    fontSize = 15.sp,
-                                    lineHeight = 20.sp,
-                                    isMine = true
-                                )
-                            } else {
-                                Text(
-                                    text = viewingMessage!!.content,
-                                    color = Color.White,
-                                    fontSize = 15.sp
-                                )
+                            IconButton(onClick = { viewingMessage = null }) {
+                                Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back", tint = Color.White)
+                            }
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Column {
+                                Text(text = senderN, color = Color.White, fontWeight = FontWeight.Bold, fontSize = 16.sp)
+                                Text(text = msgTime, color = Color.White.copy(alpha = 0.7f), fontSize = 12.sp)
+                            }
+                        }
+
+                        if (viewingMessage!!.content.isNotBlank()) {
+                            Box(
+                                modifier = Modifier
+                                    .align(Alignment.BottomCenter)
+                                    .fillMaxWidth()
+                                    .background(androidx.compose.ui.graphics.Brush.verticalGradient(
+                                        colors = listOf(Color.Transparent, Color.Black.copy(alpha = 0.8f))
+                                    ))
+                                    .padding(start = 24.dp, end = 24.dp, top = 24.dp, bottom = 48.dp)
+                            ) {
+                                if (com.flasskdev.vibe.utils.TextFormatting.hasFormatting(viewingMessage!!.content)) {
+                                    FormattedText(
+                                        text = viewingMessage!!.content,
+                                        baseColor = Color.White,
+                                        fontSize = 15.sp,
+                                        lineHeight = 20.sp,
+                                        isMine = true
+                                    )
+                                } else {
+                                    Text(
+                                        text = viewingMessage!!.content,
+                                        color = Color.White,
+                                        fontSize = 15.sp
+                                    )
+                                }
                             }
                         }
                     }
@@ -2572,8 +1134,7 @@ fun ChatScreen(
             }
         }
     }
-    }
-    
+
     if (reportMessage != null) {
         ReportDialog(
             onDismiss = { reportMessage = null },
@@ -2593,19 +1154,19 @@ fun ChatScreen(
     if (spamblockErrorMsg != null) {
         AlertDialog(
             onDismissRequest = { spamblockErrorMsg = null },
-            title = { Text("Ограничение", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface) },
+            title = { Text(strings.restrictionTitle, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface) },
             text = { Text(spamblockErrorMsg!!, color = MaterialTheme.colorScheme.onSurface) },
             confirmButton = {
                 TextButton(onClick = { spamblockErrorMsg = null }) {
-                    Text("Понятно", color = VibePrimary)
+                    Text(strings.restrictionUnderstood, color = VibePrimary)
                 }
             },
             dismissButton = {
-                TextButton(onClick = { 
+                TextButton(onClick = {
                     waitingForSpamInfo = true
                     webSocket.searchUsers("SpamInfo", viewModel.myUserId)
                 }) {
-                    Text("Почему?", color = VibePrimary)
+                    Text(strings.restrictionWhy, color = VibePrimary)
                 }
             },
             containerColor = MaterialTheme.colorScheme.surface
@@ -2631,18 +1192,18 @@ fun ChatScreen(
                             targetTimestamp = selectedMillis,
                             messageList = messages,
                             onNotFound = {
-                                triggerToast("Сообщений за эту дату не найдено")
+                                toast.show(strings.dateJumpNotFound)
                             }
                         )
                     }
                     showDatePicker = false
                 }) {
-                    Text("OK", color = VibePrimary, fontWeight = FontWeight.Bold)
+                    Text(strings.okBtn, color = VibePrimary, fontWeight = FontWeight.Bold)
                 }
             },
             dismissButton = {
                 TextButton(onClick = { showDatePicker = false }) {
-                    Text("Отмена", color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f))
+                    Text(strings.cancelBtn, color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f))
                 }
             },
             colors = DatePickerDefaults.colors(
@@ -2653,7 +1214,7 @@ fun ChatScreen(
                 state = datePickerState,
                 title = {
                     Text(
-                        text = "Выберите дату",
+                        text = strings.datePickerTitle,
                         modifier = Modifier.padding(start = 24.dp, end = 12.dp, top = 16.dp),
                         fontSize = 16.sp,
                         fontWeight = FontWeight.Bold,
@@ -2690,26 +1251,14 @@ fun ChatScreen(
             onProfileClick = onProfileClick
         )
     }
-
-    Box(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(bottom = 80.dp),
-        contentAlignment = Alignment.BottomCenter
-    ) {
-        com.flasskdev.vibe.ui.components.VibeToast(
-            message = toastMessage,
-            isVisible = showToast,
-            onDismiss = { showToast = false }
-        )
-    }
+    ChatToastHost(state = toast)
 
     if (botAlertText != null) {
         AlertDialog(
             onDismissRequest = { botAlertText = null },
             title = {
                 Text(
-                    text = effectiveUser?.name ?: "Сообщение от бота",
+                    text = effectiveUser?.name ?: strings.botMessageTitle,
                     fontWeight = FontWeight.Bold,
                     color = MaterialTheme.colorScheme.onSurface
                 )
@@ -2723,7 +1272,7 @@ fun ChatScreen(
             },
             confirmButton = {
                 TextButton(onClick = { botAlertText = null }) {
-                    Text("OK", color = VibePrimary, fontWeight = FontWeight.Bold)
+                    Text(strings.okBtn, color = VibePrimary, fontWeight = FontWeight.Bold)
                 }
             },
             containerColor = MaterialTheme.colorScheme.surface,
@@ -2731,6 +1280,39 @@ fun ChatScreen(
         )
     }
 }
+/** Держатель координат баббла: намеренно не state, см. комментарий в MessageBubble. */
+private class BubbleCoordsHolder {
+    var value: LayoutCoordinates? = null
+}
+
+@Immutable
+data class MessageBubbleActions(
+    val onReply: (MessageEntity) -> Unit = {},
+    val onReplyClick: (Int) -> Unit = {},
+    val onEditClick: (MessageEntity) -> Unit = {},
+    val onPinRequest: (MessageEntity) -> Unit = {},
+    val onUnpinRequest: (MessageEntity) -> Unit = {},
+    val onForwardRequest: (MessageEntity) -> Unit = {},
+    val onDeleteRequest: (MessageEntity) -> Unit = {},
+    val onMenuOpenChange: (Boolean) -> Unit = {},
+    val onProfileClick: (Int, String) -> Unit = { _, _ -> },
+    val onShowCopyToast: () -> Unit = {},
+    val onImageClick: (MessageEntity, Int) -> Unit = { _, _ -> },
+    val onReportClick: (MessageEntity) -> Unit = {},
+    val onRetryUpload: (Int) -> Unit = {},
+    val onReactionToggle: (MessageEntity, String) -> Unit = { _, _ -> },
+    val onReactionLongClick: (MessageEntity, String) -> Unit = { _, _ -> },
+    val onInlineButtonClick: (MessageEntity, com.flasskdev.vibe.data.local.InlineKeyboardButton) -> Unit = { _, _ -> },
+)
+
+@Immutable
+data class MessageBubbleUserData(
+    val myUserId: Int = 0,
+    val myDisplayName: String? = null,
+    val myAvatarUrl: String? = null,
+    val partnerName: String? = null,
+    val partnerAvatarUrl: String? = null,
+)
 
 @OptIn(ExperimentalFoundationApi::class, ExperimentalMaterial3Api::class)
 @Composable
@@ -2738,56 +1320,90 @@ fun MessageBubble(
     modifier: Modifier = Modifier,
     message: MessageEntity,
     repliedMessage: MessageEntity? = null,
-    isMine: Boolean, 
+    isMine: Boolean,
     isNewerSameSender: Boolean = false,
     isOlderSameSender: Boolean = false,
     strings: com.flasskdev.vibe.ui.theme.VibeStrings,
     isHighlighted: Boolean = false,
-    onReply: (MessageEntity) -> Unit,
-    onReplyClick: (Int) -> Unit,
-    onEditClick: (MessageEntity) -> Unit,
     isPinned: Boolean = false,
-    onPinRequest: (MessageEntity) -> Unit = {},
-    onUnpinRequest: (MessageEntity) -> Unit = {},
     isSelected: Boolean = false,
     selectionMode: Boolean = false,
+    isAnyMessageMenuOpen: Boolean = false,
     onSelect: (() -> Unit)? = null,
-    onProfileClick: (Int, String) -> Unit,
-    onShowCopyToast: () -> Unit = {},
-    onImageClick: (MessageEntity, Int) -> Unit = { _, _ -> },
-    onReportClick: (MessageEntity) -> Unit = {},
-    onRetryUpload: (Int) -> Unit = {},
-        myAvatarUrl: String?,
-    partnerAvatarUrl: String?,
-    partnerName: String? = null,
-    myDisplayName: String? = null,
-    myUserId: Int = 0,
-
-    onReactionToggle: (MessageEntity, String) -> Unit = { _, _ -> },
-        onReactionLongClick: (MessageEntity, String) -> Unit = { _, _ -> },
+    userData: MessageBubbleUserData = MessageBubbleUserData(),
+    actions: MessageBubbleActions = MessageBubbleActions(),
     inlineKeyboardEnabled: Boolean = true,
     pendingInlineCallbackData: String? = null,
-    onInlineButtonClick: (MessageEntity, com.flasskdev.vibe.data.local.InlineKeyboardButton) -> Unit = { _, _ -> },
-    chatPlaylist: List<com.flasskdev.vibe.ui.viewmodels.AudioTrackInfo> = emptyList(),
-
-    liquidState: io.github.fletchmckee.liquid.LiquidState? = null
+    chatPlaylist: ChatAudioPlaylist = ChatAudioPlaylist.Empty,
 ) {
-    val audioPlayer = LocalGlobalAudioPlayer.current
-    val currentPlayingTrack by audioPlayer.currentTrack.collectAsState()
-    val isPlayingAudio by audioPlayer.isPlaying.collectAsState()
-    val audioProgress by audioPlayer.progress.collectAsState()
-    val audioCurrentPos by audioPlayer.currentPosition.collectAsState()
+    val onReply = actions.onReply
+    val onReplyClick = actions.onReplyClick
+    val onEditClick = actions.onEditClick
+    val onPinRequest = actions.onPinRequest
+    val onUnpinRequest = actions.onUnpinRequest
+    val onForwardRequest = actions.onForwardRequest
+    val onDeleteRequest = actions.onDeleteRequest
+    val onMenuOpenChange = actions.onMenuOpenChange
+    val onProfileClick = actions.onProfileClick
+    val onShowCopyToast = actions.onShowCopyToast
+    val onImageClick = actions.onImageClick
+    val onReportClick = actions.onReportClick
+    val onRetryUpload = actions.onRetryUpload
+    val onReactionToggle = actions.onReactionToggle
+    val onReactionLongClick = actions.onReactionLongClick
+    val onInlineButtonClick = actions.onInlineButtonClick
 
-    val timeFormatted = remember(message.timestamp) {
-        val sdf = SimpleDateFormat("HH:mm", Locale.getDefault())
-        sdf.format(Date(message.timestamp))
-    }
+    val myUserId = userData.myUserId
+    val myDisplayName = userData.myDisplayName
+    val myAvatarUrl = userData.myAvatarUrl
+    val partnerName = userData.partnerName
+    val partnerAvatarUrl = userData.partnerAvatarUrl
+
+    val audioPlayer = LocalGlobalAudioPlayer.current
+    // PERF: подписки на состояние плеера перенесены в аудио-баблы (VoiceBubbleHost /
+    // MessageAudioList). Раньше каждый видимый баббл слушал progress/currentPosition,
+    // и при проигрывании весь список рекомпозился десятки раз в секунду.
+
+    val timeFormatted = remember(message.timestamp) { formatBubbleTime(message.timestamp) }
 
     val context = androidx.compose.ui.platform.LocalContext.current
-    var offsetX by remember { mutableFloatStateOf(0f) }
-    val animatedOffsetX by animateFloatAsState(targetValue = offsetX, label = "swipe")
+    // PERF: раньше offsetX читался в композиции через animateFloatAsState + Modifier.offset,
+    // поэтому баббл рекомпозился каждый кадр свайпа. Animatable + graphicsLayer держат
+    // всё это на фазе draw.
+    val swipeScope = rememberCoroutineScope()
+    val swipeX = remember { Animatable(0f) }
     var showMenu by remember { mutableStateOf(false) }
-    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    val menuAnchor = rememberVibeMenuAnchor()
+    val keyboard = androidx.compose.ui.platform.LocalSoftwareKeyboardController.current
+
+    val isTarget = showMenu || (isAnyMessageMenuOpen && isSelected)
+    val targetScale by animateFloatAsState(
+        targetValue = if (isTarget) 1.03f else 1f,
+        animationSpec = spring(dampingRatio = 0.74f, stiffness = Spring.StiffnessMedium),
+        label = "bubbleMenuScale"
+    )
+    val targetElevation by animateDpAsState(
+        targetValue = if (isTarget) 12.dp else 0.dp,
+        animationSpec = tween(180),
+        label = "bubbleMenuElevation"
+    )
+    val bubbleBlur by animateDpAsState(
+        targetValue = if (isAnyMessageMenuOpen && !isTarget) 16.dp else 0.dp,
+        animationSpec = tween(180),
+        label = "bubbleBlur"
+    )
+
+    // PERF: координаты баббла держим в обычном холдере, не в snapshot-состоянии.
+    // Запись состояния из onPlaced инвалидировала бы баббл на каждом кадре скролла,
+    // а значение нужно ровно один раз - в момент открытия меню.
+    val bubbleCoords = remember { BubbleCoordsHolder() }
+
+    // Пункт 7: сообщаем наверх, открыто ли меню. onDispose нужен на случай, когда
+    // строка уезжает из LazyColumn с открытым меню: иначе панель ввода осталась бы скрытой.
+    DisposableEffect(showMenu) {
+        onMenuOpenChange(showMenu)
+        onDispose { if (showMenu) onMenuOpenChange(false) }
+    }
 
     val highlightAnim = remember { Animatable(0f) }
     LaunchedEffect(isHighlighted) {
@@ -2813,9 +1429,10 @@ fun MessageBubble(
     val isGif = message.content.startsWith("gif:")
 
     Row(
-                modifier = modifier
+        modifier = modifier
             .fillMaxWidth()
-            .offset(x = animatedOffsetX.dp),
+            .blur(bubbleBlur)
+            .graphicsLayer { translationX = swipeX.value * density },
 
         horizontalArrangement = if (isMine) Arrangement.End else Arrangement.Start
     ) {
@@ -2824,18 +1441,21 @@ fun MessageBubble(
         val theirBubbleColor = if (isDark) VibeBubbleTheirsDark else VibeBubbleTheirs
         val bubbleBg = if (isMine) myBubbleColor else theirBubbleColor
 
-        val images = message.attachments?.filter { com.flasskdev.vibe.utils.AttachmentUtils.isImage(it) } ?: emptyList()
-        val videos = message.attachments?.filter { com.flasskdev.vibe.utils.AttachmentUtils.isPlayableVideo(it) } ?: emptyList()
-        val mediaAttachments = images + videos
-        
-        val files = message.attachments?.filter { 
-            !com.flasskdev.vibe.utils.AttachmentUtils.isImage(it) && 
-            !com.flasskdev.vibe.utils.AttachmentUtils.isPlayableVideo(it) && 
-            !com.flasskdev.vibe.utils.AttachmentUtils.isPlayableAudio(it) 
-        } ?: emptyList()
-        
-        val audios = message.attachments?.filter { com.flasskdev.vibe.utils.AttachmentUtils.isPlayableAudio(it) } ?: emptyList()
-        
+        // PERF: 4 прохода фильтрации по вложениям выполнялись на каждой рекомпозиции баббла.
+        val attachmentBuckets = remember(message.attachments) {
+            val atts = message.attachments ?: emptyList()
+            val imgs = atts.filter { com.flasskdev.vibe.utils.AttachmentUtils.isImage(it) }
+            val vids = atts.filter { com.flasskdev.vibe.utils.AttachmentUtils.isPlayableVideo(it) }
+            val auds = atts.filter { com.flasskdev.vibe.utils.AttachmentUtils.isPlayableAudio(it) }
+            val other = atts.filter { it !in imgs && it !in vids && it !in auds }
+            AttachmentBuckets(images = imgs, videos = vids, audios = auds, files = other)
+        }
+        val images = attachmentBuckets.images
+        val videos = attachmentBuckets.videos
+        val mediaAttachments = attachmentBuckets.mediaAttachments
+        val files = attachmentBuckets.files
+        val audios = attachmentBuckets.audios
+
         val isOnlyImagesAndText = mediaAttachments.isNotEmpty() && files.isEmpty() && audios.isEmpty() && !isVoiceMessage && !isVideoMessage && message.replyToId == null && message.forwardedFromId == null
 
         val actualBubbleBg = if (isOnlyImagesAndText || isVideoMessage || isSticker || isGif) Color.Transparent else bubbleBg
@@ -2879,26 +1499,31 @@ fun MessageBubble(
                 horizontalAlignment = if (isMine) Alignment.End else Alignment.Start
             ) {
                 Box(
-                                        modifier = Modifier
+                    modifier = Modifier
                         // Keep reply-swipe handling on the message body only. The old parent-level
                         // gesture detector consumed slight horizontal motion from inline button taps.
                         .pointerInput(message.id) {
                             detectHorizontalDragGestures(
                                 onDragEnd = {
-                                    if (offsetX > 60f || offsetX < -60f) onReply(message)
-                                    offsetX = 0f
+                                    val released = swipeX.value
+                                    if (released > 60f || released < -60f) onReply(message)
+                                    swipeScope.launch { swipeX.animateTo(0f) }
                                 },
-                                onDragCancel = { offsetX = 0f },
+                                onDragCancel = { swipeScope.launch { swipeX.animateTo(0f) } },
                                 onHorizontalDrag = { change, dragAmount ->
                                     change.consume()
-                                    offsetX = (offsetX + dragAmount * 0.5f).coerceIn(-100f, 100f)
+                                    val target = (swipeX.value + dragAmount * 0.5f).coerceIn(-100f, 100f)
+                                    swipeScope.launch { swipeX.snapTo(target) }
                                 }
                             )
                         }
+                        .zIndex(if (isTarget) 10f else 0f)
                         .graphicsLayer {
-
-                            scaleX = scale
-                            scaleY = scale
+                            scaleX = scale * targetScale
+                            scaleY = scale * targetScale
+                            shadowElevation = targetElevation.toPx()
+                            shape = bubbleShape
+                            clip = false
                         }
                         .widthIn(max = 280.dp)
                         .clip(bubbleShape)
@@ -2914,14 +1539,23 @@ fun MessageBubble(
                                 drawRect(highlightOverlayColor)
                             }
                         }
+                        .onPlaced { bubbleCoords.value = it }
                         .combinedClickable(
-                            onLongClick = { 
-                                if (!selectionMode) onSelect?.invoke() 
+                            onLongClick = {
+                                if (!selectionMode) onSelect?.invoke()
                             },
                             onClick = {
                                 if (selectionMode) {
                                     onSelect?.invoke()
                                 } else {
+                                    // Меню открывается у самого баббла, поэтому его границы
+                                    // снимаются здесь: попап должен знать, от чего расти.
+                                    val bounds = bubbleCoords.value?.boundsInWindow()
+                                        ?: androidx.compose.ui.geometry.Rect.Zero
+                                    menuAnchor.bounds = bounds
+                                    menuAnchor.highlightBounds = bounds
+                                    menuAnchor.cornerRadius = 18.dp
+                                    keyboard?.hide()
                                     showMenu = true
                                 }
                             }
@@ -2930,502 +1564,475 @@ fun MessageBubble(
                 ) {
                     Column {
                         if (message.replyToId != null) {
-                    val replyBg = if (isMine) Color.White.copy(alpha = 0.15f) else androidx.compose.material3.MaterialTheme.colorScheme.onSurface.copy(alpha = 0.08f)
-                    val barColor = if (isMine) Color.White else VibePrimary
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth(0.9f)
-                            .clip(RoundedCornerShape(8.dp))
-                            .background(replyBg)
-                            .clickable { onReplyClick(message.replyToId!!) }
-                            .padding(6.dp)
-                    ) {
-                        Box(
-                            modifier = Modifier
-                                .width(3.dp)
-                                .height(34.dp)
-                                .background(barColor, RoundedCornerShape(1.5.dp))
-                        )
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Column(modifier = Modifier.weight(1f)) {
-                                                        val senderName = message.replyToSenderName
-                                ?: repliedMessage?.let { sourceMessage ->
-                                    when {
-                                        sourceMessage.senderId == myUserId ->
-                                            myDisplayName?.takeIf { it.isNotBlank() } ?: strings.you
-                                        sourceMessage.senderType.equals("bot", ignoreCase = true) ->
-                                            partnerName?.takeIf { it.isNotBlank() } ?: "Бот"
-                                        else -> partnerName?.takeIf { it.isNotBlank() }
-                                            ?: (strings.replyTo ?: "Ответ")
-                                    }
-                                }
-                                ?: (strings.replyTo ?: "Ответ")
-
-                            Text(
-                                text = senderName, 
-                                color = barColor, 
-                                fontSize = 13.sp, 
-                                fontWeight = FontWeight.Bold,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis
-                            )
-                            if (repliedMessage != null) {
-                                MessagePreviewBlock(
-                                    message = repliedMessage,
-                                    textColor = if (isMine) Color.White.copy(alpha = 0.95f) else androidx.compose.material3.MaterialTheme.colorScheme.onSurface,
-                                    fontSize = 13.sp,
-                                    isMine = isMine
+                            val replyBg = if (isMine) Color.White.copy(alpha = 0.15f) else androidx.compose.material3.MaterialTheme.colorScheme.onSurface.copy(alpha = 0.08f)
+                            val barColor = if (isMine) Color.White else VibePrimary
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth(0.9f)
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .background(replyBg)
+                                    .clickable { onReplyClick(message.replyToId!!) }
+                                    .padding(6.dp)
+                            ) {
+                                Box(
+                                    modifier = Modifier
+                                        .width(3.dp)
+                                        .height(34.dp)
+                                        .background(barColor, RoundedCornerShape(1.5.dp))
                                 )
-                            } else if (message.replyToContent != null) {
-                                val repText = com.flasskdev.vibe.utils.MessageUtils.formatMessagePreview(message.replyToContent, null).replace("\n", " ")
-                                val repColor = if (isMine) Color.White.copy(alpha = 0.95f) else androidx.compose.material3.MaterialTheme.colorScheme.onSurface
-                                if (com.flasskdev.vibe.utils.TextFormatting.hasFormatting(repText)) {
-                                    FormattedText(
-                                        text = repText,
-                                        baseColor = repColor,
-                                        fontSize = 13.sp,
-                                        lineHeight = 16.sp,
-                                        maxLines = 1,
-                                        interactive = false,
-                                        isMine = isMine
-                                    )
-                                } else {
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Column(modifier = Modifier.weight(1f)) {
+                                    val senderName = message.replyToSenderName
+                                        ?: repliedMessage?.let { sourceMessage ->
+                                            when {
+                                                sourceMessage.senderId == myUserId ->
+                                                    myDisplayName?.takeIf { it.isNotBlank() } ?: strings.you
+                                                sourceMessage.senderType.equals("bot", ignoreCase = true) ->
+                                                    partnerName?.takeIf { it.isNotBlank() } ?: strings.botLabel
+                                                else -> partnerName?.takeIf { it.isNotBlank() }
+                                                    ?: (strings.replyTo)
+                                            }
+                                        }
+                                        ?: (strings.replyTo)
+
                                     Text(
-                                        text = repText, 
-                                        color = repColor, 
-                                        fontSize = 13.sp, 
+                                        text = senderName,
+                                        color = barColor,
+                                        fontSize = 13.sp,
+                                        fontWeight = FontWeight.Bold,
                                         maxLines = 1,
                                         overflow = TextOverflow.Ellipsis
                                     )
+                                    if (repliedMessage != null) {
+                                        MessagePreviewBlock(
+                                            message = repliedMessage,
+                                            textColor = if (isMine) Color.White.copy(alpha = 0.95f) else androidx.compose.material3.MaterialTheme.colorScheme.onSurface,
+                                            fontSize = 13.sp,
+                                            isMine = isMine
+                                        )
+                                    } else if (message.replyToContent != null) {
+                                        val repText = com.flasskdev.vibe.utils.MessageUtils.formatMessagePreview(message.replyToContent, null).replace("\n", " ")
+                                        val repColor = if (isMine) Color.White.copy(alpha = 0.95f) else androidx.compose.material3.MaterialTheme.colorScheme.onSurface
+                                        if (com.flasskdev.vibe.utils.TextFormatting.hasFormatting(repText)) {
+                                            FormattedText(
+                                                text = repText,
+                                                baseColor = repColor,
+                                                fontSize = 13.sp,
+                                                lineHeight = 16.sp,
+                                                maxLines = 1,
+                                                interactive = false,
+                                                isMine = isMine
+                                            )
+                                        } else {
+                                            Text(
+                                                text = repText,
+                                                color = repColor,
+                                                fontSize = 13.sp,
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis
+                                            )
+                                        }
+                                    }
                                 }
                             }
+                            Spacer(modifier = Modifier.height(6.dp))
                         }
-                    }
-                    Spacer(modifier = Modifier.height(6.dp))
-                }
 
-                if (message.forwardedFromId != null) {
-                    val fwdId = message.forwardedFromId
-                    val fwdName = message.forwardedFromName ?: "Пользователь"
-                    val actualContent = message.content
-                    
-                    val replyBg = if (isMine) Color.White.copy(alpha = 0.15f) else androidx.compose.material3.MaterialTheme.colorScheme.onSurface.copy(alpha = 0.08f)
-                    val barColor = if (isMine) Color.White else VibePrimary
-                    
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth(0.9f)
-                            .clip(RoundedCornerShape(8.dp))
-                            .background(replyBg)
-                            .clickable { 
-                                if (fwdId == -1) {
-                                    onShowCopyToast()
-                                } else {
-                                    onProfileClick(fwdId, fwdName)
-                                }
-                            }
-                            .padding(6.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Icon(
-                            imageVector = Icons.AutoMirrored.Filled.Reply,
-                            contentDescription = "Forwarded",
-                            tint = barColor,
-                            modifier = Modifier.size(16.dp).scale(scaleX = -1f, scaleY = 1f)
-                        )
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text(
-                            text = strings.forwardedFrom(fwdName),
-                            color = barColor,
-                            fontSize = 12.sp,
-                            fontWeight = FontWeight.Bold,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
-                        )
-                    }
-                    Spacer(modifier = Modifier.height(6.dp))
-                }
-                val contentToRender = if (message.forwardedFromId != null) message.content else message.content
-                if (isSticker) {
-                    com.flasskdev.vibe.ui.components.StickerMessage(
-                        stickerId = com.flasskdev.vibe.ui.components.StickerRepository.idFromContent(message.content),
-                        timeText = timeFormatted,
-                        isMine = isMine,
-                        isRead = message.isRead,
-                        isPending = message.id < 0
-                    )
-                } else if (isGif) {
-                    com.flasskdev.vibe.ui.components.GifMessage(
-                        url = message.attachments?.firstOrNull() ?: "",
-                        meta = message.content,
-                        timeText = timeFormatted,
-                        isMine = isMine,
-                        isRead = message.isRead,
-                        isPending = message.id < 0,
-                        onClick = { onImageClick(message, 0) }
-                    )
-                } else if (isVideoMessage) {
-                    val videoUrl = message.attachments?.firstOrNull() ?: ""
-                    val ms = message.content.substringAfter("video_message:").toLongOrNull() ?: 0L
-                    val totalSec = ms / 1000
-                    val durationString = String.format("%d:%02d", totalSec / 60, totalSec % 60)
-                    com.flasskdev.vibe.ui.components.VideoMessageBubble(
-                        videoUrl = videoUrl,
-                        durationFormatted = durationString,
-                        onClick = { onImageClick(message, 0) }
-                    )
-                } else if (isVoiceMessage) {
-                    val audioUrl = message.attachments?.firstOrNull() ?: ""
-                    val isThisPlaying = currentPlayingTrack?.id == message.id.toString()
-                    val durationString = if (message.content.startsWith("duration:")) {
-                        val ms = message.content.substringAfter("duration:").toLongOrNull() ?: 0L
-                        val totalSec = ms / 1000
-                        String.format("%d:%02d", totalSec / 60, totalSec % 60)
-                    } else {
-                        "Голосовое"
-                    }
-                    val formattedPos = if (isThisPlaying && isPlayingAudio) {
-                        val sec = audioCurrentPos / 1000
-                        String.format("%d:%02d", sec / 60, sec % 60)
-                    } else {
-                        durationString
-                    }
-                    VoiceMessageBubble(
-                        isPlaying = isThisPlaying && isPlayingAudio,
-                        progress = if (isThisPlaying) audioProgress else 0f,
-                        isMine = isMine,
-                        messageId = message.id,
-                        durationFormatted = formattedPos,
-                        onPlayClick = {
-                            audioPlayer.playAudio(
-                                AudioTrackInfo(
-                                    id = message.id.toString(),
-                                    url = audioUrl,
-                                    title = if (isMine) "Вы (Голосовое)" else "Голосовое сообщение",
-                                    avatarUrl = if (isMine) myAvatarUrl else partnerAvatarUrl
-                                )
-                            )
-                        }
-                    )
-                } else {
-                    if (mediaAttachments.isNotEmpty()) {
-                        MessageAttachmentsGrid(attachments = mediaAttachments, onImageClick = { idx -> onImageClick(message, idx) })
-                        Spacer(modifier = Modifier.height(6.dp))
-                    }
-                    if (audios.isNotEmpty()) {
-                        MessageAudioList(
-                            audios = audios,
-                            message = message,
-                            audioPlayer = audioPlayer,
-                            currentPlayingTrack = currentPlayingTrack,
-                            isPlayingAudio = isPlayingAudio,
-                            isMine = isMine,
-                            bubbleBg = bubbleBg,
-                            myAvatarUrl = myAvatarUrl,
-                            partnerAvatarUrl = partnerAvatarUrl,
-                            chatPlaylist = chatPlaylist
-                        )
-                        Spacer(modifier = Modifier.height(6.dp))
-                    }
-                    if (files.isNotEmpty()) {
-                        MessageFilesList(files = files, context = context, isMine = isMine, bubbleBg = bubbleBg)
-                        Spacer(modifier = Modifier.height(6.dp))
-                    }
-                    
-                    val innerModifier = if (isOnlyImagesAndText) {
-                        Modifier
-                            .clip(RoundedCornerShape(12.dp))
-                            .background(bubbleBg)
-                            .padding(horizontal = 14.dp, vertical = 8.dp)
-                    } else {
-                        Modifier
-                    }
-                    
-                    Box(modifier = innerModifier) {
-                        Column {
-                            val plainContent = if (message.content.startsWith("duration:") || message.content.startsWith("video_message:")) "" else contentToRender
-                            if (plainContent.isNotEmpty()) {
-                                if (TextFormatting.hasFormatting(plainContent)) {
-                                    FormattedText(
-                                        text = plainContent,
-                                        baseColor = if (isMine || isOnlyImagesAndText) Color.White else androidx.compose.material3.MaterialTheme.colorScheme.onBackground,
-                                        fontSize = 15.sp,
-                                        lineHeight = 20.sp,
-                                        onMentionClick = { username ->
-                                            // Could navigate to user profile by username
-                                        },
-                                        onProfileClick = onProfileClick,
-                                        isMine = isMine
-                                    )
-                                } else {
-                                    Text(
-                                        text = plainContent,
-                                        color = if (isMine || isOnlyImagesAndText) Color.White else androidx.compose.material3.MaterialTheme.colorScheme.onBackground,
-                                        fontSize = 15.sp,
-                                        lineHeight = 20.sp
-                                    )
-                                }
-                                Spacer(modifier = Modifier.height(2.dp))
-                            }
+                        if (message.forwardedFromId != null) {
+                            val fwdId = message.forwardedFromId
+                            val fwdName = message.forwardedFromName ?: strings.userLabel
+                            val actualContent = message.content
+
+                            val replyBg = if (isMine) Color.White.copy(alpha = 0.15f) else androidx.compose.material3.MaterialTheme.colorScheme.onSurface.copy(alpha = 0.08f)
+                            val barColor = if (isMine) Color.White else VibePrimary
+
                             Row(
-                                modifier = Modifier.align(Alignment.End),
+                                modifier = Modifier
+                                    .fillMaxWidth(0.9f)
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .background(replyBg)
+                                    .clickable {
+                                        if (fwdId == -1) {
+                                            onShowCopyToast()
+                                        } else {
+                                            onProfileClick(fwdId, fwdName)
+                                        }
+                                    }
+                                    .padding(6.dp),
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
-                                Text(
-                                    text = timeFormatted + if (message.isEdited) strings.editedLabel else "",
-                                    color = if (isMine || isOnlyImagesAndText) Color.White.copy(alpha = 0.7f) else androidx.compose.material3.MaterialTheme.colorScheme.onBackground.copy(alpha = 0.4f),
-                                    fontSize = 11.sp
+                                Icon(
+                                    imageVector = Icons.AutoMirrored.Filled.Reply,
+                                    contentDescription = "Forwarded",
+                                    tint = barColor,
+                                    modifier = Modifier.size(16.dp).scale(scaleX = -1f, scaleY = 1f)
                                 )
-                                if (isPinned) {
-                                    Spacer(modifier = Modifier.width(4.dp))
-                                    Icon(
-                                        imageVector = Icons.Filled.PushPin,
-                                        contentDescription = "Pinned",
-                                        tint = if (isMine || isOnlyImagesAndText) Color.White.copy(alpha = 0.8f) else androidx.compose.material3.MaterialTheme.colorScheme.onBackground.copy(alpha = 0.5f),
-                                        modifier = Modifier.size(12.dp)
-                                    )
-                                }
-                                if (isMine) {
-                                    Spacer(modifier = Modifier.width(4.dp))
-                                    if (message.uploadStatus == "UPLOADING") {
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text(
+                                    text = strings.forwardedFrom(fwdName),
+                                    color = barColor,
+                                    fontSize = 12.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
+                            Spacer(modifier = Modifier.height(6.dp))
+                        }
+                        val contentToRender = if (message.forwardedFromId != null) message.content else message.content
+                        if (isSticker) {
+                            com.flasskdev.vibe.ui.components.StickerMessage(
+                                stickerId = com.flasskdev.vibe.ui.components.StickerRepository.idFromContent(message.content),
+                                timeText = timeFormatted,
+                                isMine = isMine,
+                                isRead = message.isRead,
+                                isPending = message.id < 0
+                            )
+                        } else if (isGif) {
+                            com.flasskdev.vibe.ui.components.GifMessage(
+                                url = message.attachments?.firstOrNull() ?: "",
+                                meta = message.content,
+                                timeText = timeFormatted,
+                                isMine = isMine,
+                                isRead = message.isRead,
+                                isPending = message.id < 0,
+                                onClick = { onImageClick(message, 0) }
+                            )
+                        } else if (isVideoMessage) {
+                            // ПУНКТ 2. Раньше кружок рисовался прямоугольным
+                            // VideoMessageBubble — то есть выглядел как обычное видео.
+                            // CircleMessageBubble уже лежал в проекте, но не вызывался
+                            // ниоткуда. Активный кружок ровно один: см. ActiveCircle.
+                            val videoUrl = message.attachments?.firstOrNull() ?: ""
+                            val ms = message.content.substringAfter("video_message:").toLongOrNull() ?: 0L
+                            com.flasskdev.vibe.ui.circles.CircleMessageBubble(
+                                videoUrl = videoUrl,
+                                // Обложку достаёт Coil через VideoFrameDecoder, он уже
+                                // зарегистрирован в MainActivity, поэтому отдельная
+                                // генерация превью не нужна.
+                                thumbUrl = videoUrl.takeIf { it.isNotBlank() },
+                                durationMs = ms,
+                                isMine = isMine,
+                                isActive = com.flasskdev.vibe.ui.circles.ActiveCircle.activeMessageId == message.id,
+                                onActivate = { com.flasskdev.vibe.ui.circles.ActiveCircle.toggle(message.id) }
+                            )
+                        } else if (isVoiceMessage) {
+                            VoiceBubbleHost(
+                                message = message,
+                                isMine = isMine,
+                                myAvatarUrl = myAvatarUrl,
+                                partnerAvatarUrl = partnerAvatarUrl
+                            )
+                        } else {
+                            if (mediaAttachments.isNotEmpty()) {
+                                MessageAttachmentsGrid(attachments = mediaAttachments, onImageClick = { idx -> onImageClick(message, idx) })
+                                Spacer(modifier = Modifier.height(6.dp))
+                            }
+                            if (audios.isNotEmpty()) {
+                                MessageAudioList(
+                                    audios = audios,
+                                    message = message,
+                                    audioPlayer = audioPlayer,
+                                    isMine = isMine,
+                                    bubbleBg = bubbleBg,
+                                    myAvatarUrl = myAvatarUrl,
+                                    partnerAvatarUrl = partnerAvatarUrl,
+                                    chatPlaylist = chatPlaylist
+                                )
+                                Spacer(modifier = Modifier.height(6.dp))
+                            }
+                            if (files.isNotEmpty()) {
+                                MessageFilesList(files = files, context = context, isMine = isMine, bubbleBg = bubbleBg)
+                                Spacer(modifier = Modifier.height(6.dp))
+                            }
+
+                            val innerModifier = if (isOnlyImagesAndText) {
+                                Modifier
+                                    .clip(RoundedCornerShape(12.dp))
+                                    .background(bubbleBg)
+                                    .padding(horizontal = 14.dp, vertical = 8.dp)
+                            } else {
+                                Modifier
+                            }
+
+                            Box(modifier = innerModifier) {
+                                Column {
+                                    val plainContent = if (message.content.startsWith("duration:") || message.content.startsWith("video_message:")) "" else contentToRender
+                                    if (plainContent.isNotEmpty()) {
+                                        if (TextFormatting.hasFormatting(plainContent)) {
+                                            FormattedText(
+                                                text = plainContent,
+                                                baseColor = if (isMine || isOnlyImagesAndText) Color.White else androidx.compose.material3.MaterialTheme.colorScheme.onBackground,
+                                                fontSize = 15.sp,
+                                                lineHeight = 20.sp,
+                                                onMentionClick = { username ->
+                                                    // Could navigate to user profile by username
+                                                },
+                                                onProfileClick = onProfileClick,
+                                                isMine = isMine
+                                            )
+                                        } else {
+                                            Text(
+                                                text = plainContent,
+                                                color = if (isMine || isOnlyImagesAndText) Color.White else androidx.compose.material3.MaterialTheme.colorScheme.onBackground,
+                                                fontSize = 15.sp,
+                                                lineHeight = 20.sp
+                                            )
+                                        }
+                                        Spacer(modifier = Modifier.height(2.dp))
+                                    }
+                                    Row(
+                                        modifier = Modifier.align(Alignment.End),
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
                                         Text(
-                                            text = "${message.uploadProgress ?: 0}%",
-                                            color = Color.White.copy(alpha = 0.7f),
-                                            fontSize = 10.sp,
-                                            modifier = Modifier.padding(end = 4.dp)
+                                            text = timeFormatted + if (message.isEdited) strings.editedLabel else "",
+                                            color = if (isMine || isOnlyImagesAndText) Color.White.copy(alpha = 0.7f) else androidx.compose.material3.MaterialTheme.colorScheme.onBackground.copy(alpha = 0.4f),
+                                            fontSize = 11.sp
                                         )
-                                        androidx.compose.material3.CircularProgressIndicator(
-                                            progress = { (message.uploadProgress ?: 0) / 100f },
-                                            modifier = Modifier.size(12.dp),
-                                            color = Color.White,
-                                            trackColor = Color.White.copy(alpha = 0.3f),
-                                            strokeWidth = 2.dp
-                                        )
-                                    } else if (message.uploadStatus == "FAILED") {
-                                        Icon(
-                                            imageVector = Icons.Default.Warning,
-                                            contentDescription = "Retry",
-                                            tint = VibeError,
-                                            modifier = Modifier.size(14.dp).clickable { onRetryUpload(message.id) }
-                                        )
-                                    } else if (message.id < 0) {
-                                        Icon(
-                                            imageVector = Icons.Default.Schedule,
-                                            contentDescription = "Pending",
-                                            tint = Color.White.copy(alpha = 0.7f),
-                                            modifier = Modifier.size(14.dp)
-                                        )
-                                    } else {
-                                        Icon(
-                                            imageVector = if (message.isRead) Icons.Default.DoneAll else Icons.Default.Check,
-                                            contentDescription = "Read status",
-                                            tint = if (message.isRead) Color(0xFF81D4FA) else Color.White.copy(alpha = 0.7f),
-                                            modifier = Modifier.size(14.dp)
-                                        )
+                                        if (isPinned) {
+                                            Spacer(modifier = Modifier.width(4.dp))
+                                            Icon(
+                                                imageVector = Icons.Filled.PushPin,
+                                                contentDescription = "Pinned",
+                                                tint = if (isMine || isOnlyImagesAndText) Color.White.copy(alpha = 0.8f) else androidx.compose.material3.MaterialTheme.colorScheme.onBackground.copy(alpha = 0.5f),
+                                                modifier = Modifier.size(12.dp)
+                                            )
+                                        }
+                                        if (isMine) {
+                                            Spacer(modifier = Modifier.width(4.dp))
+                                            if (message.uploadStatus == "UPLOADING") {
+                                                Text(
+                                                    text = "${message.uploadProgress ?: 0}%",
+                                                    color = Color.White.copy(alpha = 0.7f),
+                                                    fontSize = 10.sp,
+                                                    modifier = Modifier.padding(end = 4.dp)
+                                                )
+                                                androidx.compose.material3.CircularProgressIndicator(
+                                                    progress = { (message.uploadProgress ?: 0) / 100f },
+                                                    modifier = Modifier.size(12.dp),
+                                                    color = Color.White,
+                                                    trackColor = Color.White.copy(alpha = 0.3f),
+                                                    strokeWidth = 2.dp
+                                                )
+                                            } else if (message.uploadStatus == "FAILED") {
+                                                Icon(
+                                                    imageVector = Icons.Default.Warning,
+                                                    contentDescription = "Retry",
+                                                    tint = VibeError,
+                                                    modifier = Modifier.size(14.dp).clickable { onRetryUpload(message.id) }
+                                                )
+                                            } else if (message.id < 0) {
+                                                Icon(
+                                                    imageVector = Icons.Default.Schedule,
+                                                    contentDescription = "Pending",
+                                                    tint = Color.White.copy(alpha = 0.7f),
+                                                    modifier = Modifier.size(14.dp)
+                                                )
+                                            } else {
+                                                Icon(
+                                                    imageVector = if (message.isRead) Icons.Default.DoneAll else Icons.Default.Check,
+                                                    contentDescription = "Read status",
+                                                    tint = if (message.isRead) Color(0xFF81D4FA) else Color.White.copy(alpha = 0.7f),
+                                                    modifier = Modifier.size(14.dp)
+                                                )
+                                            }
+                                        }
                                     }
                                 }
                             }
                         }
+
+                        if (!message.reactions.isNullOrEmpty()) {
+                            MessageReactionsRow(
+                                reactions = message.reactions!!,
+                                myUserId = myUserId,
+                                isMine = isMine,
+                                onReactionClick = { emoji -> onReactionToggle(message, emoji) },
+                                onReactionLongClick = { emoji -> onReactionLongClick(message, emoji) }
+                            )
+                        }
                     }
                 }
 
-                if (!message.reactions.isNullOrEmpty()) {
-                    MessageReactionsRow(
-                        reactions = message.reactions!!,
-                        myUserId = myUserId,
-                        isMine = isMine,
-                        onReactionClick = { emoji -> onReactionToggle(message, emoji) },
-                        onReactionLongClick = { emoji -> onReactionLongClick(message, emoji) }
+                if (message.replyMarkup != null && message.replyMarkup.inlineKeyboard.isNotEmpty()) {
+                    Spacer(modifier = Modifier.height(5.dp))
+                    com.flasskdev.vibe.ui.components.InlineKeyboard(
+                        replyMarkup = message.replyMarkup,
+                        onButtonClick = { btn -> onInlineButtonClick(message, btn) },
+                        isInteractionEnabled = inlineKeyboardEnabled,
+                        pendingCallbackData = pendingInlineCallbackData,
+                        modifier = Modifier.fillMaxWidth()
+
                     )
                 }
             }
         }
+    }
 
-        if (message.replyMarkup != null && message.replyMarkup.inlineKeyboard.isNotEmpty()) {
-            Spacer(modifier = Modifier.height(5.dp))
-            com.flasskdev.vibe.ui.components.InlineKeyboard(
-                replyMarkup = message.replyMarkup,
-                                onButtonClick = { btn -> onInlineButtonClick(message, btn) },
-                liquidState = liquidState,
-                isInteractionEnabled = inlineKeyboardEnabled,
-                pendingCallbackData = pendingInlineCallbackData,
-                modifier = Modifier.fillMaxWidth()
+// ========== ПУНКТ 7: КОНТЕКСТНОЕ МЕНЮ СООБЩЕНИЯ ==========
+// Раньше здесь был ModalBottomSheet: меню приезжало снизу через полэкрана,
+// перекрывало само сообщение, к которому относится, и выглядело как отдельная
+// подсистема на фоне меню в списке чатов. Теперь то же якорное стекло, что и там,
+// плюс быстрые реакции в шапке.
+    val menuActions = buildList {
+        add(
+            VibeMenuAction(
+                label = strings.replyTo,
+                icon = Icons.AutoMirrored.Filled.Reply,
+                onClick = {
+                    showMenu = false
+                    onReply(message)
+                }
+            )
+        )
 
+        val hasTextContent = !isVoiceMessage && !isVideoMessage &&
+                !isSticker && !isGif &&
+                message.content.isNotBlank()
+
+        if (hasTextContent) {
+            add(
+                VibeMenuAction(
+                    label = strings.actionCopy,
+                    icon = Icons.Default.ContentCopy,
+                    onClick = {
+                        showMenu = false
+                        val plainText = com.flasskdev.vibe.utils.TextFormatting.stripFormatting(message.content)
+                        val clipboard = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                        clipboard.setPrimaryClip(android.content.ClipData.newPlainText("message", plainText))
+                        onShowCopyToast()
+                    }
+                )
+            )
+        }
+
+        // Правка доступна сутки и только для своего текста: серверный лимит совпадает.
+        val canEdit = isMine && hasTextContent &&
+                (System.currentTimeMillis() - message.timestamp <= 24 * 60 * 60 * 1000)
+        if (canEdit) {
+            add(
+                VibeMenuAction(
+                    label = strings.edit,
+                    icon = Icons.Default.Edit,
+                    onClick = {
+                        showMenu = false
+                        onEditClick(message)
+                    }
+                )
+            )
+        }
+
+        add(
+            VibeMenuAction(
+                label = strings.actionForward,
+                icon = Icons.AutoMirrored.Filled.Send,
+                startsGroup = true,
+                onClick = {
+                    showMenu = false
+                    onForwardRequest(message)
+                }
+            )
+        )
+
+        // Пункт 8: выбрать сообщение можно было только длинным нажатием, о котором
+        // в интерфейсе ничего не говорило. Теперь это обычный пункт меню.
+        if (onSelect != null) {
+            add(
+                VibeMenuAction(
+                    label = strings.actionSelectMessage,
+                    icon = Icons.Outlined.CheckCircle,
+                    onClick = {
+                        showMenu = false
+                        onSelect.invoke()
+                    }
+                )
+            )
+        }
+
+        add(
+            VibeMenuAction(
+                label = if (isPinned) strings.unpinMessage else strings.pinMessage,
+                icon = Icons.Default.PushPin,
+                rotateIcon = isPinned,
+                selected = isPinned,
+                onClick = {
+                    showMenu = false
+                    if (isPinned) onUnpinRequest(message) else onPinRequest(message)
+                }
+            )
+        )
+
+        if (!message.attachments.isNullOrEmpty()) {
+            val attachmentCount = message.attachments!!.size
+            add(
+                VibeMenuAction(
+                    label = if (attachmentCount > 1) strings.actionDownloadSelected else strings.actionDownload,
+                    icon = Icons.Outlined.Download,
+                    onClick = {
+                        showMenu = false
+                        val filesToDownload = message.attachments!!.map { att ->
+                            com.flasskdev.vibe.utils.DownloadHelper.resolveUrl(att) to
+                                    com.flasskdev.vibe.utils.AttachmentUtils.getFilename(att)
+                        }
+                        if (filesToDownload.size == 1) {
+                            com.flasskdev.vibe.utils.DownloadHelper.downloadFile(
+                                context, filesToDownload[0].first, filesToDownload[0].second
+                            )
+                        } else {
+                            com.flasskdev.vibe.utils.DownloadHelper.downloadFiles(context, filesToDownload)
+                        }
+                    }
+                )
+            )
+        }
+
+        // Пункт 8: удалить одно сообщение было нельзя вообще - только через
+        // мультивыделение в хедере.
+        add(
+            VibeMenuAction(
+                label = strings.deleteBtn,
+                icon = Icons.Default.Delete,
+                destructive = true,
+                startsGroup = true,
+                onClick = {
+                    showMenu = false
+                    onDeleteRequest(message)
+                }
+            )
+        )
+
+        if (!isMine) {
+            add(
+                VibeMenuAction(
+                    label = strings.actionReport,
+                    icon = Icons.Outlined.Warning,
+                    destructive = true,
+                    onClick = {
+                        showMenu = false
+                        onReportClick(message)
+                    }
+                )
             )
         }
     }
-}
-}
-            
-if (showMenu) {
-                ModalBottomSheet(
-                    onDismissRequest = { showMenu = false },
-                    sheetState = sheetState,
-                    containerColor = androidx.compose.material3.MaterialTheme.colorScheme.surface,
-                    shape = RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp)
-                ) {
-                    Column(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(bottom = 32.dp, top = 8.dp, start = 16.dp, end = 16.dp)
-                    ) {
-                        QuickReactionsBar(
-                            currentReactions = message.reactions ?: emptyList(),
-                            myUserId = myUserId,
-                            onSelectEmoji = { emoji ->
-                                showMenu = false
-                                onReactionToggle(message, emoji)
-                            }
-                        )
-                        Spacer(modifier = Modifier.height(12.dp))
 
-                        val hasTextContent = !isVoiceMessage && !isVideoMessage &&
-                            message.content.isNotBlank() &&
-                            !message.content.startsWith("duration:") &&
-                            !message.content.startsWith("video_message:")
-                        
-                        val canEdit = isMine && 
-                            (System.currentTimeMillis() - message.timestamp <= 24 * 60 * 60 * 1000) &&
-                            !isVoiceMessage && !isVideoMessage &&
-                            (hasTextContent || (!message.attachments.isNullOrEmpty() && message.content.isNotBlank() && !message.content.startsWith("duration:") && !message.content.startsWith("video_message:")))
-                        
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .clip(RoundedCornerShape(16.dp))
-                                .background(androidx.compose.material3.MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f))
-                                .clickable {
-                                    showMenu = false
-                                    onReply(message)
-                                }
-                                .padding(12.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Icon(Icons.AutoMirrored.Filled.Reply, contentDescription = null, tint = VibePrimary)
-                            Spacer(modifier = Modifier.width(16.dp))
-                            Text(strings.replyTo ?: "Ответить", fontSize = 16.sp, fontWeight = FontWeight.SemiBold, color = androidx.compose.material3.MaterialTheme.colorScheme.onSurface)
-                        }
-                        
-                        if (hasTextContent) {
-                            Spacer(modifier = Modifier.height(4.dp))
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .clip(RoundedCornerShape(16.dp))
-                                    .background(androidx.compose.material3.MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f))
-                                    .clickable {
-                                        showMenu = false
-                                        val plainText = com.flasskdev.vibe.utils.TextFormatting.stripFormatting(message.content)
-                                        val clipboard = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
-                                        clipboard.setPrimaryClip(android.content.ClipData.newPlainText("message", plainText))
-                                        onShowCopyToast()
-                                    }
-                                    .padding(12.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Icon(Icons.Default.ContentCopy, contentDescription = null, tint = VibePrimary)
-                                Spacer(modifier = Modifier.width(16.dp))
-                                Text(strings.actionCopy, fontSize = 16.sp, fontWeight = FontWeight.SemiBold, color = androidx.compose.material3.MaterialTheme.colorScheme.onSurface)
-                            }
-                        }
-                        
-                        if (canEdit) {
-                            Spacer(modifier = Modifier.height(4.dp))
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .clip(RoundedCornerShape(16.dp))
-                                    .background(androidx.compose.material3.MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f))
-                                    .clickable {
-                                        showMenu = false
-                                        onEditClick(message)
-                                    }
-                                    .padding(12.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Icon(Icons.Default.Edit, contentDescription = null, tint = VibePrimary)
-                                Spacer(modifier = Modifier.width(16.dp))
-                                Text(strings.edit ?: "Изменить", fontSize = 16.sp, fontWeight = FontWeight.SemiBold, color = androidx.compose.material3.MaterialTheme.colorScheme.onSurface)
-                            }
-                        }
-
-                        Spacer(modifier = Modifier.height(4.dp))
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .clip(RoundedCornerShape(16.dp))
-                                .background(androidx.compose.material3.MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f))
-                                .clickable {
-                                    showMenu = false
-                                    if (isPinned) onUnpinRequest(message) else onPinRequest(message)
-                                }
-                                .padding(12.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Icon(if (isPinned) Icons.Outlined.PushPin else Icons.Default.PushPin, contentDescription = null, tint = VibePrimary)
-                            Spacer(modifier = Modifier.width(16.dp))
-                            Text(if (isPinned) (strings.unpinMessage ?: "Открепить") else (strings.pinMessage ?: "Закрепить"), fontSize = 16.sp, fontWeight = FontWeight.SemiBold, color = androidx.compose.material3.MaterialTheme.colorScheme.onSurface)
-                        }
-
-                        if (!message.attachments.isNullOrEmpty()) {
-                            Spacer(modifier = Modifier.height(4.dp))
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .clip(RoundedCornerShape(16.dp))
-                                    .background(androidx.compose.material3.MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f))
-                                    .clickable {
-                                        showMenu = false
-                                        val atts = message.attachments!!
-                                        val filesToDownload = atts.map { att ->
-                                            val url = com.flasskdev.vibe.utils.DownloadHelper.resolveUrl(att)
-                                            val filename = com.flasskdev.vibe.utils.AttachmentUtils.getFilename(att)
-                                            url to filename
-                                        }
-                                        if (filesToDownload.size == 1) {
-                                            com.flasskdev.vibe.utils.DownloadHelper.downloadFile(
-                                                context, filesToDownload[0].first, filesToDownload[0].second
-                                            )
-                                        } else {
-                                            com.flasskdev.vibe.utils.DownloadHelper.downloadFiles(context, filesToDownload)
-                                        }
-                                    }
-                                    .padding(12.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Icon(Icons.Default.Download, contentDescription = null, tint = VibePrimary)
-                                Spacer(modifier = Modifier.width(16.dp))
-                                Text(
-                                    text = if (message.attachments!!.size > 1) strings.actionDownloadSelected else strings.actionDownload,
-                                    fontSize = 16.sp,
-                                    fontWeight = FontWeight.SemiBold,
-                                    color = androidx.compose.material3.MaterialTheme.colorScheme.onSurface
-                                )
-                            }
-                        }
-
-                        if (!isMine) {
-                            Spacer(modifier = Modifier.height(4.dp))
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .clip(RoundedCornerShape(16.dp))
-                                    .background(androidx.compose.material3.MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f))
-                                    .clickable {
-                                        showMenu = false
-                                        onReportClick(message)
-                                    }
-                                    .padding(12.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Icon(Icons.Default.Warning, contentDescription = null, tint = Color.Red.copy(alpha = 0.8f))
-                                Spacer(modifier = Modifier.width(16.dp))
-                                Text(strings.actionReport, fontSize = 16.sp, fontWeight = FontWeight.SemiBold, color = Color.Red.copy(alpha = 0.8f))
-                            }
-                        }
-                    }
+    VibeContextMenu(
+        expanded = showMenu,
+        anchor = menuAnchor,
+        onDismiss = { showMenu = false },
+        actions = menuActions,
+        header = {
+            QuickReactionsBar(
+                currentReactions = message.reactions ?: emptyList(),
+                myUserId = myUserId,
+                onSelectEmoji = { emoji ->
+                    showMenu = false
+                    onReactionToggle(message, emoji)
                 }
-            }
+            )
+        }
+    )
 }
 
 @Composable
@@ -3437,14 +2044,14 @@ fun DateSeparator(
     val dateText = remember(dateMillis) {
         val now = Calendar.getInstance()
         val msgDate = Calendar.getInstance().apply { timeInMillis = dateMillis }
-        
+
         when {
             now.get(Calendar.YEAR) == msgDate.get(Calendar.YEAR) &&
                     now.get(Calendar.DAY_OF_YEAR) == msgDate.get(Calendar.DAY_OF_YEAR) -> strings.dateToday
-            
+
             now.get(Calendar.YEAR) == msgDate.get(Calendar.YEAR) &&
                     now.get(Calendar.DAY_OF_YEAR) - msgDate.get(Calendar.DAY_OF_YEAR) == 1 -> strings.dateYesterday
-            
+
             else -> {
                 val pattern = if (now.get(Calendar.YEAR) == msgDate.get(Calendar.YEAR)) {
                     "d MMMM"
@@ -3481,7 +2088,7 @@ fun DateSeparator(
 
 
 
-private fun formatLastSeen(lastSeenTimestamp: Long?, strings: com.flasskdev.vibe.ui.theme.VibeStrings): String {
+internal fun formatLastSeen(lastSeenTimestamp: Long?, strings: com.flasskdev.vibe.ui.theme.VibeStrings): String {
     if (lastSeenTimestamp == null) return strings.lastSeenRecently
 
     val now = Calendar.getInstance()
@@ -3515,9 +2122,10 @@ private fun formatLastSeen(lastSeenTimestamp: Long?, strings: com.flasskdev.vibe
 
 @Composable
 fun MessageAttachmentsGrid(attachments: List<String>, onImageClick: (Int) -> Unit) {
+    val strings = com.flasskdev.vibe.ui.theme.LocalVibeStrings.current
     val itemsPerRow = if (attachments.size == 1) 1 else if (attachments.size in 2..4) 2 else 3
     val spacing = 4.dp
-    
+
     Column(
         verticalArrangement = Arrangement.spacedBy(spacing),
         modifier = Modifier.fillMaxWidth().padding(bottom = 4.dp)
@@ -3539,7 +2147,15 @@ fun MessageAttachmentsGrid(attachments: List<String>, onImageClick: (Int) -> Uni
                     } else {
                         "https://flasskdev.alwaysdata.net/api/upload/file/$attachmentPath"
                     }
-                                        val isVideo = com.flasskdev.vibe.utils.AttachmentUtils.isPlayableVideo(attachmentPath)
+                    val isVideo = com.flasskdev.vibe.utils.AttachmentUtils.isPlayableVideo(attachmentPath)
+                    val context = androidx.compose.ui.platform.LocalContext.current
+                    // PERF: ImageRequest пересобирался на каждой рекомпозиции сетки.
+                    val imageRequest = remember(model, context) {
+                        coil.request.ImageRequest.Builder(context)
+                            .data(model)
+                            .crossfade(true)
+                            .build()
+                    }
 
                     Box(modifier = Modifier
                         .weight(1f)
@@ -3548,18 +2164,15 @@ fun MessageAttachmentsGrid(attachments: List<String>, onImageClick: (Int) -> Uni
                         .background(if (isVideo) androidx.compose.material3.MaterialTheme.colorScheme.surfaceVariant else Color.Transparent)
                         .clickable { onImageClick(currentIndex) }
                     ) {
-                                                if (isVideo) {
+                        if (isVideo) {
                             com.flasskdev.vibe.ui.components.VideoCover(
                                 source = model,
                                 modifier = Modifier.fillMaxSize()
                             )
                         } else {
                             AsyncImage(
-                                model = coil.request.ImageRequest.Builder(androidx.compose.ui.platform.LocalContext.current)
-                                    .data(model)
-                                    .crossfade(true)
-                                    .build(),
-                                contentDescription = "Вложение",
+                                model = imageRequest,
+                                contentDescription = strings.attachmentLabel,
                                 contentScale = ContentScale.Crop,
                                 modifier = Modifier.fillMaxSize()
                             )
@@ -3579,17 +2192,19 @@ fun MessageAttachmentsGrid(attachments: List<String>, onImageClick: (Int) -> Uni
 
 @Composable
 fun MessageAudioList(
-    audios: List<String>, 
+    audios: List<String>,
     message: MessageEntity,
     audioPlayer: com.flasskdev.vibe.ui.viewmodels.GlobalAudioPlayerViewModel,
-    currentPlayingTrack: com.flasskdev.vibe.ui.viewmodels.AudioTrackInfo?,
-    isPlayingAudio: Boolean,
-    isMine: Boolean, 
+    isMine: Boolean,
     bubbleBg: Color,
     myAvatarUrl: String?,
     partnerAvatarUrl: String?,
-    chatPlaylist: List<com.flasskdev.vibe.ui.viewmodels.AudioTrackInfo> = emptyList()
+    chatPlaylist: ChatAudioPlaylist = ChatAudioPlaylist.Empty
 ) {
+    // PERF: состояние плеера читается здесь, а не в каждом MessageBubble.
+    val strings = com.flasskdev.vibe.ui.theme.LocalVibeStrings.current
+    val currentPlayingTrack by audioPlayer.currentTrack.collectAsState()
+    val isPlayingAudio by audioPlayer.isPlaying.collectAsState()
     val audioProgress by audioPlayer.progress.collectAsState()
     val audioCurrentPos by audioPlayer.currentPosition.collectAsState()
     val audioDuration by audioPlayer.duration.collectAsState()
@@ -3603,20 +2218,24 @@ fun MessageAudioList(
             val initialMeta = androidx.compose.runtime.remember(audioUrl) {
                 com.flasskdev.vibe.utils.AudioMetadataHelper.getCachedMetadata(audioUrl)
             }
-            var audioMeta by androidx.compose.runtime.remember(audioUrl) { 
-                androidx.compose.runtime.mutableStateOf(initialMeta) 
+            var audioMeta by androidx.compose.runtime.remember(audioUrl) {
+                androidx.compose.runtime.mutableStateOf(initialMeta)
             }
             androidx.compose.runtime.LaunchedEffect(audioUrl) {
-                val meta = com.flasskdev.vibe.utils.AudioMetadataHelper.getMetadata(audioUrl)
+                // PERF: LaunchedEffect стартует на MAIN. MediaMetadataRetriever по сети
+                // блокировал UI-поток на секунды при входе в чат с аудио.
+                val meta = withContext(Dispatchers.IO) {
+                    com.flasskdev.vibe.utils.AudioMetadataHelper.getMetadata(audioUrl)
+                }
                 audioMeta = meta
                 val tTitle = if (meta.displayArtist.isNotBlank()) "${meta.displayArtist} — ${meta.displayTitle}" else meta.displayTitle
                 audioPlayer.updateTrackTitle(trackId, tTitle)
             }
-            
-            val displayTitle = audioMeta?.displayTitle ?: "Аудиозапись"
+
+            val displayTitle = audioMeta?.displayTitle ?: strings.typeAudio
             val displayArtist = audioMeta?.displayArtist?.takeIf { it.isNotBlank() } ?: ""
             val displayDuration = audioMeta?.durationMs ?: 0L
-            
+
             val isThisPlaying = currentPlayingTrack?.id == trackId
             val textColor = if (isMine) Color.White else androidx.compose.material3.MaterialTheme.colorScheme.onBackground
             val subColor = textColor.copy(alpha = 0.55f)
@@ -3625,7 +2244,7 @@ fun MessageAudioList(
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .clickable { 
+                    .clickable {
                         if (isThisPlaying) {
                             if (isPlayingAudio) audioPlayer.pause() else audioPlayer.resume()
                         } else {
@@ -3636,8 +2255,8 @@ fun MessageAudioList(
                                 title = trackTitle,
                                 avatarUrl = if (isMine) myAvatarUrl else partnerAvatarUrl
                             )
-                            val finalPlaylist = if (chatPlaylist.isNotEmpty()) {
-                                chatPlaylist.map { if (it.id == trackId) currentTrackInfo else it }
+                            val finalPlaylist = if (chatPlaylist.tracks.isNotEmpty()) {
+                                chatPlaylist.tracks.map { if (it.id == trackId) currentTrackInfo else it }
                             } else {
                                 listOf(currentTrackInfo)
                             }
@@ -3653,29 +2272,41 @@ fun MessageAudioList(
                     contentAlignment = Alignment.Center
                 ) {
                     val coverArtBytes = audioMeta?.coverArt
-                    if (coverArtBytes != null) {
-                        val bitmap = androidx.compose.runtime.remember(coverArtBytes) {
-                            android.graphics.BitmapFactory.decodeByteArray(coverArtBytes, 0, coverArtBytes.size)
-                        }
-                        if (bitmap != null) {
-                            androidx.compose.foundation.Image(
-                                bitmap = bitmap.asImageBitmap(),
-                                contentDescription = "Cover",
-                                contentScale = androidx.compose.ui.layout.ContentScale.Crop,
-                                modifier = Modifier.fillMaxSize().clip(RoundedCornerShape(10.dp))
-                            )
-                            // Overlay play/pause
-                            Box(
-                                modifier = Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.35f)),
-                                contentAlignment = Alignment.Center
-                            ) {
-                                Icon(
-                                    imageVector = if (isThisPlaying && isPlayingAudio) Icons.Default.Pause else Icons.Default.PlayArrow,
-                                    contentDescription = null,
-                                    tint = Color.White,
-                                    modifier = Modifier.size(24.dp)
+                    // PERF: BitmapFactory.decodeByteArray выполнялся внутри remember, то есть
+                    // прямо в композиции на UI-потоке, для каждого аудио-сообщения в чате.
+                    // Теперь декод уходит в фон, а до его завершения рисуется обычная плашка.
+                    var cover by androidx.compose.runtime.remember(coverArtBytes) {
+                        androidx.compose.runtime.mutableStateOf<android.graphics.Bitmap?>(null)
+                    }
+                    androidx.compose.runtime.LaunchedEffect(coverArtBytes) {
+                        cover = if (coverArtBytes == null) null else withContext(Dispatchers.Default) {
+                            runCatching {
+                                android.graphics.BitmapFactory.decodeByteArray(
+                                    coverArtBytes, 0, coverArtBytes.size
                                 )
-                            }
+                            }.getOrNull()
+                        }
+                    }
+
+                    val decoded = cover
+                    if (decoded != null) {
+                        androidx.compose.foundation.Image(
+                            bitmap = decoded.asImageBitmap(),
+                            contentDescription = "Cover",
+                            contentScale = androidx.compose.ui.layout.ContentScale.Crop,
+                            modifier = Modifier.fillMaxSize().clip(RoundedCornerShape(10.dp))
+                        )
+                        // Overlay play/pause
+                        Box(
+                            modifier = Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.35f)),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Icon(
+                                imageVector = if (isThisPlaying && isPlayingAudio) Icons.Default.Pause else Icons.Default.PlayArrow,
+                                contentDescription = null,
+                                tint = Color.White,
+                                modifier = Modifier.size(24.dp)
+                            )
                         }
                     } else {
                         Box(
@@ -3734,7 +2365,7 @@ fun MessageAudioList(
                         val sec = audioCurrentPos / 1000
                         String.format("%d:%02d", sec / 60, sec % 60)
                     } else "0:00"
-                    
+
                     val durToUse = if (audioDuration > 0) audioDuration else displayDuration
                     val durStr = if (durToUse > 0) {
                         val sec = durToUse / 1000
@@ -3755,6 +2386,7 @@ fun MessageAudioList(
 
 @Composable
 fun MessageFilesList(files: List<String>, context: android.content.Context, isMine: Boolean, bubbleBg: androidx.compose.ui.graphics.Color) {
+    val strings = com.flasskdev.vibe.ui.theme.LocalVibeStrings.current
     val textColor = if (isMine) Color.White else androidx.compose.material3.MaterialTheme.colorScheme.onBackground
     val subColor = textColor.copy(alpha = 0.5f)
 
@@ -3766,9 +2398,11 @@ fun MessageFilesList(files: List<String>, context: android.content.Context, isMi
             val extension = "." + fullFilename.substringAfterLast(".", "")
             val downloadUrl = if (isLocal) attachmentPath else if (attachmentPath.startsWith("http")) attachmentPath else "https://flasskdev.alwaysdata.net/api/upload/file/$attachmentPath"
 
-            var fileSizeText by androidx.compose.runtime.remember(downloadUrl) { androidx.compose.runtime.mutableStateOf("Загрузка...") }
+            var fileSizeText by androidx.compose.runtime.remember(downloadUrl) { androidx.compose.runtime.mutableStateOf(strings.fileSizeLoading) }
             androidx.compose.runtime.LaunchedEffect(downloadUrl) {
-                fileSizeText = com.flasskdev.vibe.utils.AttachmentUtils.getFileSizeAsync(downloadUrl)
+                fileSizeText = withContext(Dispatchers.IO) {
+                    com.flasskdev.vibe.utils.AttachmentUtils.getFileSizeAsync(downloadUrl)
+                }
             }
 
             Row(
@@ -3836,6 +2470,7 @@ fun MessagePreviewBlock(
     fontSize: androidx.compose.ui.unit.TextUnit = 13.sp,
     isMine: Boolean = false
 ) {
+    val strings = com.flasskdev.vibe.ui.theme.LocalVibeStrings.current
     val rawPreview = com.flasskdev.vibe.utils.MessageUtils.formatMessagePreview(message.content, message.attachments)
     val isAudio = message.attachments?.any { com.flasskdev.vibe.utils.AttachmentUtils.isPlayableAudio(it) } == true
     val isVideo = message.attachments?.any { com.flasskdev.vibe.utils.AttachmentUtils.isPlayableVideo(it) } == true
@@ -3855,21 +2490,23 @@ fun MessagePreviewBlock(
     }
 
     var dynamicAudioTitle by androidx.compose.runtime.remember(message.attachments) { androidx.compose.runtime.mutableStateOf<String?>(null) }
-    
+
     androidx.compose.runtime.LaunchedEffect(message.attachments) {
         if (isAudio && !message.attachments.isNullOrEmpty()) {
             val firstAtt = message.attachments.first { com.flasskdev.vibe.utils.AttachmentUtils.isPlayableAudio(it) }
             val isLocal = firstAtt.startsWith("/") || firstAtt.startsWith("content://") || firstAtt.contains("cacheDir")
             val url = if (isLocal) firstAtt else if (firstAtt.startsWith("http")) firstAtt else "https://flasskdev.alwaysdata.net/api/upload/file/$firstAtt"
-            val meta = com.flasskdev.vibe.utils.AudioMetadataHelper.getMetadata(url)
+            val meta = withContext(Dispatchers.IO) {
+                com.flasskdev.vibe.utils.AudioMetadataHelper.getMetadata(url)
+            }
             dynamicAudioTitle = if (meta.displayArtist != "Unknown Artist") "${meta.displayArtist} — ${meta.displayTitle}" else meta.displayTitle
         }
     }
 
     val cleanText = rawPreview.removePrefix("\uD83D\uDCF9 ").removePrefix("\uD83C\uDFA4 ").removePrefix("\uD83D\uDDBC ").removePrefix("\uD83C\uDFAC ").removePrefix("\uD83C\uDFB5 ").removePrefix("\uD83D\uDCCE ").removePrefix("+")
-    
+
     val displayText = when {
-        isAudio && (message.content.isBlank() || message.content.startsWith("Музыка")) -> dynamicAudioTitle ?: "Музыка..."
+        isAudio && (message.content.isBlank() || message.content.startsWith("Музыка")) -> dynamicAudioTitle ?: strings.previewAudioLoading
         else -> cleanText.replace("\n", " ")
     }
 
@@ -3906,49 +2543,6 @@ fun MessagePreviewBlock(
 }
 
 
-@Composable
-private fun FormatButton(
-    icon: androidx.compose.ui.graphics.vector.ImageVector,
-    onClick: () -> Unit
-) {
-    Box(
-        modifier = Modifier
-            .clip(RoundedCornerShape(8.dp))
-            .clickable(onClick = onClick)
-            .background(androidx.compose.material3.MaterialTheme.colorScheme.surface)
-            .padding(horizontal = 12.dp, vertical = 8.dp),
-        contentAlignment = Alignment.Center
-    ) {
-        androidx.compose.material3.Icon(
-            imageVector = icon,
-            contentDescription = null,
-            tint = VibePrimary,
-            modifier = Modifier.size(20.dp)
-        )
-    }
-}
-
-private fun insertFormatMarker(tfv: TextFieldValue, prefix: String, suffix: String): TextFieldValue {
-    val selStart = tfv.selection.min
-    val selEnd = tfv.selection.max
-    
-    if (selStart != selEnd) {
-        // Text is selected — wrap the selection with format markers
-        val before = tfv.text.substring(0, selStart)
-        val selected = tfv.text.substring(selStart, selEnd)
-        val after = tfv.text.substring(selEnd)
-        val newText = before + prefix + selected + suffix + after
-        val newCursorPos = selStart + prefix.length + selected.length + suffix.length
-        return TextFieldValue(newText, TextRange(newCursorPos))
-    } else {
-        // No selection — insert markers at cursor position
-        val before = tfv.text.substring(0, selStart)
-        val after = tfv.text.substring(selStart)
-        val newText = before + prefix + suffix + after
-        val newCursorPos = selStart + prefix.length
-        return TextFieldValue(newText, TextRange(newCursorPos))
-    }
-}
 
 @Composable
 fun QuickReactionsBar(
@@ -4086,6 +2680,7 @@ fun ReactionDetailsBottomSheet(
     onDismiss: () -> Unit,
     onProfileClick: (Int, String) -> Unit
 ) {
+    val strings = com.flasskdev.vibe.ui.theme.LocalVibeStrings.current
     val modalSheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     val listState = rememberLazyListState()
 
@@ -4123,14 +2718,14 @@ fun ReactionDetailsBottomSheet(
                 horizontalArrangement = Arrangement.SpaceBetween
             ) {
                 Text(
-                    text = "Реакции",
+                    text = strings.reactionsTitle,
                     style = androidx.compose.material3.MaterialTheme.typography.titleMedium,
                     fontWeight = FontWeight.Bold
                 )
                 IconButton(onClick = onDismiss, modifier = Modifier.size(28.dp)) {
                     Icon(
                         imageVector = Icons.Default.Close,
-                        contentDescription = "Close",
+                        contentDescription = strings.actionClose,
                         tint = androidx.compose.material3.MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f),
                         modifier = Modifier.size(20.dp)
                     )
@@ -4158,7 +2753,7 @@ fun ReactionDetailsBottomSheet(
                         .padding(horizontal = 12.dp, vertical = 6.dp)
                 ) {
                     Text(
-                        text = "Все $totalCount",
+                        text = strings.reactionsAllTab(totalCount),
                         fontSize = 13.sp,
                         fontWeight = FontWeight.SemiBold,
                         color = if (isAllSelected) Color.White else androidx.compose.material3.MaterialTheme.colorScheme.onSurface
@@ -4216,7 +2811,7 @@ fun ReactionDetailsBottomSheet(
                         contentAlignment = Alignment.Center
                     ) {
                         Text(
-                            text = "Пока нет реакций",
+                            text = strings.reactionsEmpty,
                             color = androidx.compose.material3.MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f),
                             fontSize = 14.sp
                         )
@@ -4261,6 +2856,7 @@ fun ReactionUserItem(
     user: com.flasskdev.vibe.data.ReactionUserDetail,
     onProfileClick: (Int, String) -> Unit
 ) {
+    val strings = com.flasskdev.vibe.ui.theme.LocalVibeStrings.current
     val timeFormatted = remember(user.timestamp) {
         if (user.timestamp <= 0L) "" else {
             val sdf = SimpleDateFormat("d MMM, HH:mm", Locale.getDefault())
@@ -4307,7 +2903,7 @@ fun ReactionUserItem(
         Column(modifier = Modifier.weight(1f)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(
-                    text = user.name ?: user.username ?: "Пользователь",
+                    text = user.name ?: user.username ?: strings.userLabel,
                     fontWeight = FontWeight.SemiBold,
                     fontSize = 15.sp,
                     color = androidx.compose.material3.MaterialTheme.colorScheme.onSurface,
@@ -4350,11 +2946,36 @@ fun ReactionUserItem(
     }
 }
 
+/**
+ * Стабильный контейнер плейлиста чата. Нужен именно data class: Compose сравнивает
+ * параметры через equals, а у голого List<T> в качестве типа параметра стабильности нет.
+ */
+@androidx.compose.runtime.Immutable
+data class ChatAudioPlaylist(
+    val tracks: List<com.flasskdev.vibe.ui.viewmodels.AudioTrackInfo>
+) {
+    companion object {
+        val Empty = ChatAudioPlaylist(emptyList())
+    }
+}
+
+/** contentType для LazyColumn: бабблы одного вида переиспользуют слоты друг друга. */
+fun messageContentType(message: com.flasskdev.vibe.data.local.MessageEntity): String = when {
+    message.content.startsWith("\$\$SYSTEM\$\$") -> "system"
+    message.content.startsWith("duration:") -> "voice"
+    message.content.startsWith("video_message:") -> "videoNote"
+    message.content.startsWith("sticker:") -> "sticker"
+    message.content.startsWith("gif:") -> "gif"
+    message.attachments.isNullOrEmpty() -> "text"
+    else -> "attachments"
+}
+
 fun buildChatAudioPlaylist(
     messages: List<com.flasskdev.vibe.data.local.MessageEntity>,
     myAvatarUrl: String?,
     partnerAvatarUrl: String?,
-    myUserId: Int
+    myUserId: Int,
+    audioFallbackTitle: String
 ): List<com.flasskdev.vibe.ui.viewmodels.AudioTrackInfo> {
     val list = mutableListOf<com.flasskdev.vibe.ui.viewmodels.AudioTrackInfo>()
     // Oldest to newest
@@ -4362,8 +2983,8 @@ fun buildChatAudioPlaylist(
         val isVoice = msg.content.startsWith("duration:")
         if (!isVoice) {
             val atts = msg.attachments ?: emptyList()
-            val audios = atts.filter { 
-                com.flasskdev.vibe.utils.AttachmentUtils.getType(it, msg.content) == com.flasskdev.vibe.utils.AttachmentType.AUDIO 
+            val audios = atts.filter {
+                com.flasskdev.vibe.utils.AttachmentUtils.getType(it, msg.content) == com.flasskdev.vibe.utils.AttachmentType.AUDIO
             }
             audios.forEach { attPath ->
                 val isLocal = attPath.startsWith("/") || attPath.startsWith("content://") || attPath.contains("cacheDir")
@@ -4372,7 +2993,7 @@ fun buildChatAudioPlaylist(
                 val trackId = "${msg.id}_${attPath.hashCode()}"
                 val trackTitle = if (meta != null && meta.displayArtist.isNotBlank()) {
                     "${meta.displayArtist} — ${meta.displayTitle}"
-                } else meta?.displayTitle ?: "Аудиозапись"
+                } else meta?.displayTitle ?: audioFallbackTitle
 
                 list.add(
                     com.flasskdev.vibe.ui.viewmodels.AudioTrackInfo(
@@ -4389,3 +3010,72 @@ fun buildChatAudioPlaylist(
 }
 
 
+
+
+/** Разобранные вложения сообщения. Считается один раз на сообщение (см. remember в MessageBubble). */
+@androidx.compose.runtime.Immutable
+data class AttachmentBuckets(
+    val images: List<String>,
+    val videos: List<String>,
+    val audios: List<String>,
+    val files: List<String>
+) {
+    val mediaAttachments: List<String> = images + videos
+}
+
+/**
+ * Голосовое сообщение вынесено в отдельный composable, чтобы высокочастотные обновления
+ * плеера (progress / currentPosition) рекомпозили только сам голосовой баббл,
+ * а не каждое видимое сообщение в списке.
+ */
+@Composable
+private fun VoiceBubbleHost(
+    message: MessageEntity,
+    isMine: Boolean,
+    myAvatarUrl: String?,
+    partnerAvatarUrl: String?
+) {
+    val strings = com.flasskdev.vibe.ui.theme.LocalVibeStrings.current
+    val audioPlayer = LocalGlobalAudioPlayer.current
+    val currentPlayingTrack by audioPlayer.currentTrack.collectAsState()
+    val isPlayingAudio by audioPlayer.isPlaying.collectAsState()
+    val audioProgress by audioPlayer.progress.collectAsState()
+    val audioCurrentPos by audioPlayer.currentPosition.collectAsState()
+
+    val audioUrl = message.attachments?.firstOrNull() ?: ""
+    val isThisPlaying = currentPlayingTrack?.id == message.id.toString()
+    val voiceFallbackLabel = strings.typeVoice
+    val durationString = remember(message.content, voiceFallbackLabel) {
+        if (message.content.startsWith("duration:")) {
+            val ms = message.content.substringAfter("duration:").toLongOrNull() ?: 0L
+            val totalSec = ms / 1000
+            String.format("%d:%02d", totalSec / 60, totalSec % 60)
+        } else {
+            voiceFallbackLabel
+        }
+    }
+    val formattedPos = if (isThisPlaying && isPlayingAudio) {
+        val sec = audioCurrentPos / 1000
+        String.format("%d:%02d", sec / 60, sec % 60)
+    } else {
+        durationString
+    }
+
+    VoiceMessageBubble(
+        isPlaying = isThisPlaying && isPlayingAudio,
+        progress = if (isThisPlaying) audioProgress else 0f,
+        isMine = isMine,
+        messageId = message.id,
+        durationFormatted = formattedPos,
+        onPlayClick = {
+            audioPlayer.playAudio(
+                AudioTrackInfo(
+                    id = message.id.toString(),
+                    url = audioUrl,
+                    title = if (isMine) strings.voiceTrackTitleMine else strings.typeVoice,
+                    avatarUrl = if (isMine) myAvatarUrl else partnerAvatarUrl
+                )
+            )
+        }
+    )
+}

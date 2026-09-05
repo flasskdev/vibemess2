@@ -4,6 +4,7 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import androidx.compose.animation.*
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
@@ -54,7 +55,7 @@ fun TextSelectionContextMenu(
     var showFormatMenu by remember { mutableStateOf(false) }
     var showLinkDialog by remember { mutableStateOf(false) }
     var showColorDialog by remember { mutableStateOf(false) }
-    
+
     val hasSelection = selectionStart != selectionEnd && selectionStart >= 0 && selectionEnd >= 0
 
     AnimatedVisibility(
@@ -86,9 +87,9 @@ fun TextSelectionContextMenu(
                             onDismiss()
                         }
                     )
-                    
+
                     VerticalDivider()
-                    
+
                     ContextMenuButton(
                         text = strings.formatCut,
                         icon = Icons.Default.ContentCut,
@@ -97,9 +98,9 @@ fun TextSelectionContextMenu(
                             onDismiss()
                         }
                     )
-                    
+
                     VerticalDivider()
-                    
+
                     ContextMenuButton(
                         text = strings.formatFormat,
                         icon = Icons.Default.TextFormat,
@@ -107,7 +108,7 @@ fun TextSelectionContextMenu(
                     )
                 }
             }
-            
+
             // Format sub-menu
             AnimatedVisibility(
                 visible = showFormatMenu,
@@ -129,7 +130,7 @@ fun TextSelectionContextMenu(
                         text = "←",
                         onClick = { showFormatMenu = false }
                     )
-                    
+
                     FormatChip(
                         text = "B",
                         isBold = true,
@@ -138,7 +139,7 @@ fun TextSelectionContextMenu(
                             onDismiss()
                         }
                     )
-                    
+
                     FormatChip(
                         text = "I",
                         isItalic = true,
@@ -147,7 +148,7 @@ fun TextSelectionContextMenu(
                             onDismiss()
                         }
                     )
-                    
+
                     FormatChip(
                         text = "S",
                         isStrikethrough = true,
@@ -156,7 +157,7 @@ fun TextSelectionContextMenu(
                             onDismiss()
                         }
                     )
-                    
+
                     FormatChip(
                         text = "U",
                         isUnderline = true,
@@ -165,7 +166,7 @@ fun TextSelectionContextMenu(
                             onDismiss()
                         }
                     )
-                    
+
                     FormatChip(
                         text = "</>",
                         isMono = true,
@@ -174,17 +175,17 @@ fun TextSelectionContextMenu(
                             onDismiss()
                         }
                     )
-                    
+
                     FormatChip(
                         text = "🔗",
                         onClick = { showLinkDialog = true }
                     )
-                    
+
                     FormatChip(
                         text = "🎨",
                         onClick = { showColorDialog = true }
                     )
-                    
+
                     FormatChip(
                         text = "||",
                         onClick = {
@@ -192,7 +193,7 @@ fun TextSelectionContextMenu(
                             onDismiss()
                         }
                     )
-                    
+
                     FormatChip(
                         text = ">>",
                         onClick = {
@@ -204,7 +205,7 @@ fun TextSelectionContextMenu(
             }
         }
     }
-    
+
     // Link URL dialog
     if (showLinkDialog) {
         var linkUrl by remember { mutableStateOf("") }
@@ -249,7 +250,7 @@ fun TextSelectionContextMenu(
             }
         )
     }
-    
+
     // Color picker dialog
     if (showColorDialog) {
         var hexColor by remember { mutableStateOf("#FF5733") }
@@ -390,7 +391,7 @@ private fun applyFormat(
     val start = selectionStart.coerceIn(0, inputText.length)
     val end = selectionEnd.coerceIn(0, inputText.length)
     if (start == end) return
-    
+
     val selectedText = inputText.substring(start, end)
     val formatted = TextFormatting.wrapWithFormat(selectedText, format)
     val newText = inputText.substring(0, start) + formatted + inputText.substring(end)
@@ -443,5 +444,212 @@ fun InputPreviewBar(
                 .height(1.dp)
                 .background(MaterialTheme.colorScheme.onSurface.copy(alpha = 0.1f)))
         }
+    }
+}
+
+/**
+ * Persistent formatting bar that shows a horizontally scrollable row of format buttons.
+ * Unlike [TextSelectionContextMenu], this bar is always visible when enabled and works
+ * both with and without text selection:
+ * - With selection: wraps the selected text in format markers.
+ * - Without selection: inserts empty format markers at the cursor position.
+ */
+@Composable
+fun FormattingBar(
+    visible: Boolean,
+    inputText: String,
+    selectionStart: Int,
+    selectionEnd: Int,
+    strings: VibeStrings,
+    onApplyFormat: (newText: String, newCursorPos: Int) -> Unit
+) {
+    var showLinkDialog by remember { mutableStateOf(false) }
+    var showColorDialog by remember { mutableStateOf(false) }
+
+    AnimatedVisibility(
+        visible = visible,
+        enter = expandVertically(animationSpec = tween(180)) + fadeIn(tween(180)),
+        exit = shrinkVertically(animationSpec = tween(160)) + fadeOut(tween(120))
+    ) {
+        Column(modifier = Modifier.fillMaxWidth()) {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(0.5.dp)
+                    .background(MaterialTheme.colorScheme.onSurface.copy(alpha = 0.12f))
+            )
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .horizontalScroll(rememberScrollState())
+                    .padding(horizontal = 8.dp, vertical = 6.dp),
+                horizontalArrangement = Arrangement.spacedBy(4.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                FormatChip(text = "B", isBold = true, onClick = {
+                    applyFormatAtCursor(inputText, selectionStart, selectionEnd, FormatType.BOLD, onApplyFormat)
+                })
+                FormatChip(text = "I", isItalic = true, onClick = {
+                    applyFormatAtCursor(inputText, selectionStart, selectionEnd, FormatType.ITALIC, onApplyFormat)
+                })
+                FormatChip(text = "S", isStrikethrough = true, onClick = {
+                    applyFormatAtCursor(inputText, selectionStart, selectionEnd, FormatType.STRIKETHROUGH, onApplyFormat)
+                })
+                FormatChip(text = "U", isUnderline = true, onClick = {
+                    applyFormatAtCursor(inputText, selectionStart, selectionEnd, FormatType.UNDERLINE, onApplyFormat)
+                })
+                FormatChip(text = "</>", isMono = true, onClick = {
+                    applyFormatAtCursor(inputText, selectionStart, selectionEnd, FormatType.MONOSPACE, onApplyFormat)
+                })
+                FormatChip(text = "🔗", onClick = { showLinkDialog = true })
+                FormatChip(text = "🎨", onClick = { showColorDialog = true })
+                FormatChip(text = "||", onClick = {
+                    applyFormatAtCursor(inputText, selectionStart, selectionEnd, FormatType.SPOILER, onApplyFormat)
+                })
+                FormatChip(text = ">>", onClick = {
+                    applyFormatAtCursor(inputText, selectionStart, selectionEnd, FormatType.QUOTE, onApplyFormat)
+                })
+            }
+        }
+    }
+
+    // Link URL dialog
+    if (showLinkDialog) {
+        var linkUrl by remember { mutableStateOf("") }
+        AlertDialog(
+            onDismissRequest = { showLinkDialog = false },
+            title = { Text(strings.formatLink, fontWeight = FontWeight.Bold) },
+            text = {
+                OutlinedTextField(
+                    value = linkUrl,
+                    onValueChange = { linkUrl = it },
+                    label = { Text(strings.formatLinkUrlHint) },
+                    singleLine = true,
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedBorderColor = VibePrimary,
+                        cursorColor = VibePrimary
+                    )
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    if (linkUrl.isNotBlank()) {
+                        val start = selectionStart.coerceIn(0, inputText.length)
+                        val end = selectionEnd.coerceIn(0, inputText.length)
+                        val selectedText = if (start != end) inputText.substring(start, end) else strings.formatLink
+                        val formatted = TextFormatting.wrapWithFormat(selectedText, FormatType.LINK, url = linkUrl)
+                        val newText = inputText.substring(0, start) + formatted + inputText.substring(end.coerceAtMost(inputText.length))
+                        onApplyFormat(newText, start + formatted.length)
+                    }
+                    showLinkDialog = false
+                }) {
+                    Text("OK", color = VibePrimary, fontWeight = FontWeight.Bold)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showLinkDialog = false }) {
+                    Text(strings.cancelBtn, color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f))
+                }
+            }
+        )
+    }
+
+    // Color picker dialog
+    if (showColorDialog) {
+        var hexColor by remember { mutableStateOf("#FF5733") }
+        AlertDialog(
+            onDismissRequest = { showColorDialog = false },
+            title = { Text(strings.formatTextColor, fontWeight = FontWeight.Bold) },
+            text = {
+                Column {
+                    OutlinedTextField(
+                        value = hexColor,
+                        onValueChange = { hexColor = it },
+                        label = { Text(strings.formatColorHint) },
+                        singleLine = true,
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedBorderColor = VibePrimary,
+                            cursorColor = VibePrimary
+                        )
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    val previewColor = try {
+                        Color(android.graphics.Color.parseColor(hexColor))
+                    } catch (_: Exception) {
+                        Color.Gray
+                    }
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(strings.formatPreview + ": ", fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f))
+                        Box(
+                            modifier = Modifier
+                                .size(24.dp)
+                                .clip(RoundedCornerShape(4.dp))
+                                .background(previewColor)
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text("Sample text", color = previewColor, fontWeight = FontWeight.SemiBold)
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    if (hexColor.startsWith("#")) {
+                        val start = selectionStart.coerceIn(0, inputText.length)
+                        val end = selectionEnd.coerceIn(0, inputText.length)
+                        val selectedText = if (start != end) inputText.substring(start, end) else " "
+                        val formatted = TextFormatting.wrapWithFormat(selectedText, FormatType.COLOR, hexColor = hexColor)
+                        val newText = inputText.substring(0, start) + formatted + inputText.substring(end.coerceAtMost(inputText.length))
+                        onApplyFormat(newText, start + formatted.length)
+                    }
+                    showColorDialog = false
+                }) {
+                    Text("OK", color = VibePrimary, fontWeight = FontWeight.Bold)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showColorDialog = false }) {
+                    Text(strings.cancelBtn, color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f))
+                }
+            }
+        )
+    }
+}
+
+/**
+ * Applies format at cursor position or wraps selection.
+ * When text is selected, wraps it. When no selection, inserts empty markers and places cursor inside.
+ */
+private fun applyFormatAtCursor(
+    inputText: String,
+    selectionStart: Int,
+    selectionEnd: Int,
+    format: FormatType,
+    onApplyFormat: (newText: String, newCursorPos: Int) -> Unit
+) {
+    val start = selectionStart.coerceIn(0, inputText.length)
+    val end = selectionEnd.coerceIn(0, inputText.length)
+
+    if (start != end) {
+        // Has selection — wrap selected text
+        val selectedText = inputText.substring(start, end)
+        val formatted = TextFormatting.wrapWithFormat(selectedText, format)
+        val newText = inputText.substring(0, start) + formatted + inputText.substring(end)
+        onApplyFormat(newText, start + formatted.length)
+    } else {
+        // No selection — insert empty markers and position cursor inside
+        val emptyFormatted = TextFormatting.wrapWithFormat("", format)
+        val newText = inputText.substring(0, start) + emptyFormatted + inputText.substring(start)
+        // Place cursor in the middle of the markers
+        val cursorOffset = when (format) {
+            FormatType.BOLD -> start + 2           // **|**
+            FormatType.ITALIC -> start + 2         // __|__
+            FormatType.STRIKETHROUGH -> start + 2  // ~~|~~
+            FormatType.UNDERLINE -> start + 2      // --|--
+            FormatType.MONOSPACE -> start + 1      // `|`
+            FormatType.SPOILER -> start + 2        // |||
+            FormatType.QUOTE -> start + 2          // >>|
+            else -> start + emptyFormatted.length
+        }
+        onApplyFormat(newText, cursorOffset)
     }
 }

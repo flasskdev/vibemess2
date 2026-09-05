@@ -7,6 +7,29 @@
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="28" />
 
+    <!--
+        ПУНКТ 2 — КРУЖКИ.
+        Без CAMERA любой bindToLifecycle() в CircleRecorder падал с SecurityException,
+        поэтому кружок физически невозможно было записать.
+        camera.any объявлена НЕ обязательной: планшеты без фронтальной камеры
+        не должны выпадать из выдачи Google Play из-за видеосообщений.
+    -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-feature android:name="android.hardware.camera.any" android:required="false" />
+    <uses-feature android:name="android.hardware.camera.autofocus" android:required="false" />
+    <uses-feature android:name="android.hardware.microphone" android:required="false" />
+
+    <!--
+        ПУНКТ 5 — ПЛЕЕР В ШТОРКЕ.
+        MediaSessionService — это foreground-сервис. С API 34 системе недостаточно
+        общего FOREGROUND_SERVICE: нужен именно типизированный
+        FOREGROUND_SERVICE_MEDIA_PLAYBACK, иначе startForeground бросает
+        SecurityException и уведомление плеера не появляется.
+    -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
     <application
         android:allowBackup="false"
         android:icon="@mipmap/ic_launcher"
@@ -35,6 +58,26 @@
             android:exported="false">
             <intent-filter>
                 <action android:name="com.google.firebase.MESSAGING_EVENT" />
+            </intent-filter>
+        </service>
+
+        <!--
+            ПУНКТ 5. Сервис не был объявлен вообще, поэтому
+            MediaController.Builder(...).buildAsync() никогда не находил сессию,
+            сервис не поднимался, и системного уведомления плеера не существовало.
+
+            exported="true" здесь обязателен: к сессии подключается не только наш
+            процесс, но и системные клиенты — Android Auto, Wear, Assistant,
+            панель медиа в шторке.
+        -->
+        <service
+            android:name=".player.VibePlaybackService"
+            android:exported="true"
+            android:foregroundServiceType="mediaPlayback"
+            tools:ignore="ExportedService">
+            <intent-filter>
+                <action android:name="androidx.media3.session.MediaSessionService" />
+                <action android:name="android.media.browse.MediaBrowserService" />
             </intent-filter>
         </service>
     </application>

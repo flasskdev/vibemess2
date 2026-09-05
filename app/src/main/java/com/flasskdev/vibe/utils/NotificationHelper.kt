@@ -31,9 +31,9 @@ class NotificationDismissReceiver : BroadcastReceiver() {
 object NotificationHelper {
     private const val CHANNEL_ID = "vibe_messages_channel"
     private const val CHANNEL_NAME = "Messages"
-    
+
     private val activeMessagingStyles = mutableMapOf<Int, NotificationCompat.MessagingStyle>()
-    
+
     var activeChatId: Int? = null
         set(value) {
             field = value
@@ -59,10 +59,10 @@ object NotificationHelper {
     }
 
     fun showMessageNotification(context: Context, senderName: String, messageContent: String, senderId: Int) {
-        if (senderId == activeChatId) return 
-        
+        if (senderId == activeChatId) return
+
         createNotificationChannel(context)
-        
+
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             if (ActivityCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
                 return
@@ -94,13 +94,13 @@ object NotificationHelper {
 
         val bitmap = createAvatarBitmap(context, senderName)
         val icon = IconCompat.createWithBitmap(bitmap)
-        
+
         val senderPerson = Person.Builder()
             .setName(senderName)
             .setIcon(icon)
             .setKey(senderId.toString())
             .build()
-            
+
         val shortcut = ShortcutInfoCompat.Builder(context, senderId.toString())
             .setShortLabel(senderName)
             .setLongLabel(senderName)
@@ -110,9 +110,9 @@ object NotificationHelper {
             .setLongLived(true)
             .setCategories(setOf("androidx.core.content.pm.shortcut_conversation"))
             .build()
-            
+
         ShortcutManagerCompat.pushDynamicShortcut(context, shortcut)
-            
+
         val mePerson = Person.Builder()
             .setName("Я")
             .build()
@@ -122,11 +122,11 @@ object NotificationHelper {
                 .setConversationTitle(senderName)
                 .setGroupConversation(false)
         }
-        
+
         messagingStyle.addMessage(messageContent, System.currentTimeMillis(), senderPerson)
 
         val builder = NotificationCompat.Builder(context, CHANNEL_ID)
-            .setSmallIcon(R.mipmap.ic_launcher_round) 
+            .setSmallIcon(R.mipmap.ic_launcher_round)
             .setLargeIcon(bitmap)
             .setStyle(messagingStyle)
             .setPriority(NotificationCompat.PRIORITY_HIGH)
@@ -136,15 +136,15 @@ object NotificationHelper {
             .setAutoCancel(true)
             .setContentIntent(pendingIntent)
             .setDeleteIntent(deletePendingIntent)
-            
+
         with(NotificationManagerCompat.from(context)) {
             notify(senderId, builder.build())
         }
     }
 
     fun editMessageNotification(context: Context, senderName: String, messageContent: String, senderId: Int) {
-        if (senderId == activeChatId) return 
-        
+        if (senderId == activeChatId) return
+
         val existingStyle = activeMessagingStyles[senderId]
         if (existingStyle == null) {
             // Если уведомления нет, просто показываем новое
@@ -193,9 +193,9 @@ object NotificationHelper {
         }
 
         activeMessagingStyles[senderId] = newStyle
-        
+
         val bitmap = createAvatarBitmap(context, senderName)
-        
+
         val intent = Intent(context, MainActivity::class.java).apply {
             action = Intent.ACTION_VIEW
             flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK
@@ -212,7 +212,7 @@ object NotificationHelper {
         )
 
         val builder = NotificationCompat.Builder(context, CHANNEL_ID)
-            .setSmallIcon(R.mipmap.ic_launcher_round) 
+            .setSmallIcon(R.mipmap.ic_launcher_round)
             .setLargeIcon(bitmap)
             .setStyle(newStyle)
             .setPriority(NotificationCompat.PRIORITY_HIGH)
@@ -243,21 +243,21 @@ object NotificationHelper {
         val bitmap = android.graphics.Bitmap.createBitmap(size, size, android.graphics.Bitmap.Config.ARGB_8888)
         val canvas = android.graphics.Canvas(bitmap)
         val paint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG)
-        
-        paint.color = android.graphics.Color.parseColor("#81D4FA") 
+
+        paint.color = android.graphics.Color.parseColor("#81D4FA")
         canvas.drawCircle(size / 2f, size / 2f, size / 2f, paint)
 
         paint.color = android.graphics.Color.WHITE
         paint.textSize = size / 2f
         paint.textAlign = android.graphics.Paint.Align.CENTER
-        
+
         val initial = if (name.isNotBlank()) name.take(1).uppercase() else "?"
         val textBounds = android.graphics.Rect()
         paint.getTextBounds(initial, 0, initial.length, textBounds)
-        
+
         val x = size / 2f
         val y = (size / 2f) - textBounds.exactCenterY()
-        
+
         canvas.drawText(initial, x, y, paint)
         return bitmap
     }

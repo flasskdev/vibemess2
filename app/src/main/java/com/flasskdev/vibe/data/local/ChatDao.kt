@@ -8,7 +8,7 @@ interface ChatDao {
     // Обновляем SQL запрос
     @Query("""
         SELECT chats.interlocutorId, chats.lastMessage, chats.timestamp, chats.unreadCount, 
-               chats.isLastMessageMine, chats.isLastMessageRead, chats.isMuted, chats.draft, chats.canMessage, chats.lastMessageAttachments, chats.pinned,
+               chats.isLastMessageMine, chats.isLastMessageRead, chats.isMuted, chats.draft, chats.canMessage, chats.lastMessageAttachments, chats.pinned, chats.lastMessageEncrypted,
                COALESCE(users_cache.isBlockedByMe, chats.isBlockedByMe) AS isBlockedByMe, 
                COALESCE(users_cache.isBlockedByUser, chats.isBlockedByUser) AS isBlockedByUser,
                COALESCE(users_cache.isDeveloper, chats.isDeveloper) AS isDeveloper, 
@@ -161,6 +161,22 @@ interface ChatDao {
         ) ORDER BY timestamp ASC, id ASC
     """)
     fun getMessagesByPartner(userId: Int, partnerId: Int, limit: Int): Flow<List<MessageEntity>>
+
+    /**
+     * Тот же запрос, но одноразовый. Нужен для прогрева (AppWarmup): SQLite
+     * компилирует statement и поднимает страницы индекса в кэш соединения ДО того,
+     * как пользователь войдёт в чат. Flow тут не нужен и был бы вреден.
+     */
+    @Query("""
+        SELECT * FROM (
+            SELECT * FROM messages 
+            WHERE (senderId = :userId AND receiverId = :partnerId)
+               OR (senderId = :partnerId AND receiverId = :userId)
+            ORDER BY timestamp DESC, id DESC 
+            LIMIT :limit
+        ) ORDER BY timestamp ASC, id ASC
+    """)
+    suspend fun getMessagesByPartnerOnce(userId: Int, partnerId: Int, limit: Int): List<MessageEntity>
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertMessage(message: MessageEntity)

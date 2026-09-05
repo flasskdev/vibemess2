@@ -56,6 +56,14 @@ val VibeSeparatorDark = Color(0xFF545458).copy(alpha = 0.24f)
 // ─── Online Indicator ───
 val VibeOnlineGreen = Color(0xFF34C759)
 
+// ─── iOS System Grays ───
+val VibeSystemGray = Color(0xFF8E8E93)
+val VibeSystemGray2 = Color(0xFFAEAEB2)
+val VibeSystemGray3 = Color(0xFFC7C7CC)
+val VibeSystemGray4 = Color(0xFFD1D1D6)
+val VibeSystemGray5 = Color(0xFFE5E5EA)
+val VibeSystemGray6 = Color(0xFFF2F2F7)
+
 // ─── Gradient Presets ───
 val VibeGradient = listOf(VibePrimary, VibeSecondary)
 val VibeGradientSubtle = listOf(

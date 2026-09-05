@@ -1,22 +1,216 @@
 package com.flasskdev.vibe.ui.screens
 
-import androidx.compose.animation.*
+import androidx.activity.compose.BackHandler
+import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.ContentTransform
+import androidx.compose.animation.SizeTransform
+import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideOutHorizontally
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.AlternateEmail
+import androidx.compose.material.icons.rounded.Info
+import androidx.compose.material.icons.rounded.Person
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.rounded.*
+import androidx.compose.ui.platform.LocalContext
+import com.flasskdev.vibe.data.UserPreferences
+import com.flasskdev.vibe.data.VibeMessage
+import com.flasskdev.vibe.data.VibeWebSocket
+import com.flasskdev.vibe.data.VibeWebSocketListener
+import com.flasskdev.vibe.data.local.AppDatabase
+import com.flasskdev.vibe.data.local.UserCacheEntity
+import com.flasskdev.vibe.ui.theme.LocalVibeStrings
+import com.flasskdev.vibe.ui.theme.VibeStrings
+import com.flasskdev.vibe.ui.theme.VibeTopGlow
+import androidx.compose.ui.unit.dp
 import io.github.fletchmckee.liquid.LiquidState
 import io.github.fletchmckee.liquid.liquefiable
-
-import com.flasskdev.vibe.data.UserPreferences
-import com.flasskdev.vibe.data.VibeWebSocket
-import kotlinx.coroutines.launch
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.firstOrNull
-import androidx.activity.compose.BackHandler
+import kotlinx.coroutines.launch
+import org.json.JSONArray
+import org.json.JSONObject
+
+/* ------------------------------------------------------------------ */
+/*  Routes                                                            */
+/* ------------------------------------------------------------------ */
+
+private const val ROUTE_MAIN = "main"
+private const val ROUTE_PRIVACY = "privacy"
+private const val ROUTE_ACCOUNT = "account"
+private const val ROUTE_DEVICES = "devices"
+private const val ROUTE_BLOCKED = "blocked_users"
+private const val ROUTE_EDIT_USERNAME = "edit_username"
+private const val ROUTE_EDIT_NICKNAME = "edit_nickname"
+private const val ROUTE_EDIT_BIO = "edit_bio"
+private const val ROUTE_VIBE_PRO = "vibe_pro"
+private const val ROUTE_PASSCODE = "passcode"
+private const val ROUTE_TWO_FACTOR = "two_factor"
+private const val EDIT_PREFIX = "edit_"
+
+private const val USERNAME_MIN_LENGTH = 4
+private const val USERNAME_CHECK_DEBOUNCE_MS = 350L
+
+/**
+ * The five privacy toggles used to be five near-identical `when` branches plus five
+ * `temp*` state holders (~200 duplicated lines). Everything that actually differed
+ * between them lives here instead: route names, the JSON key used by the backend and
+ * how the value is read from / written to [UserPreferences].
+ */
+private enum class PrivacyField(
+    val route: String,
+    val selectRoute: String,
+    val jsonKey: String,
+    val mode: (UserPreferences) -> String,
+    val setMode: (UserPreferences, String) -> Unit,
+    val users: (UserPreferences) -> String,
+    val setUsers: (UserPreferences, String) -> Unit
+) {
+    ACTIVITY(
+        route = "privacy_activity",
+        selectRoute = "privacy_select_activity",
+        jsonKey = "activity",
+        mode = { it.privacyActivity },
+        setMode = { p, v -> p.privacyActivity = v },
+        users = { it.privacyActivityUsers },
+        setUsers = { p, v -> p.privacyActivityUsers = v }
+    ),
+    AVATAR(
+        route = "privacy_avatar",
+        selectRoute = "privacy_select_avatar",
+        jsonKey = "avatar",
+        mode = { it.privacyAvatar },
+        setMode = { p, v -> p.privacyAvatar = v },
+        users = { it.privacyAvatarUsers },
+        setUsers = { p, v -> p.privacyAvatarUsers = v }
+    ),
+    FORWARDED(
+        route = "privacy_forwarded",
+        selectRoute = "privacy_select_forwarded",
+        jsonKey = "forwarded",
+        mode = { it.privacyForwarded },
+        setMode = { p, v -> p.privacyForwarded = v },
+        users = { it.privacyForwardedUsers },
+        setUsers = { p, v -> p.privacyForwardedUsers = v }
+    ),
+    MESSAGES(
+        route = "privacy_messages",
+        selectRoute = "privacy_select_messages",
+        jsonKey = "messages",
+        mode = { it.privacyMessages },
+        setMode = { p, v -> p.privacyMessages = v },
+        users = { it.privacyMessagesUsers },
+        setUsers = { p, v -> p.privacyMessagesUsers = v }
+    ),
+    STATUS(
+        route = "privacy_status",
+        selectRoute = "privacy_select_status",
+        jsonKey = "status",
+        mode = { it.privacyStatus },
+        setMode = { p, v -> p.privacyStatus = v },
+        users = { it.privacyStatusUsers },
+        setUsers = { p, v -> p.privacyStatusUsers = v }
+    );
+
+    fun title(strings: VibeStrings): String = when (this) {
+        ACTIVITY -> strings.privacyActivityTitle
+        AVATAR -> strings.privacyAvatarTitle
+        FORWARDED -> strings.privacyForwardedTitle
+        MESSAGES -> strings.privacyMessagesTitle
+        STATUS -> strings.privacyStatusTitle
+    }
+
+    fun description(strings: VibeStrings): String = when (this) {
+        ACTIVITY -> strings.privacyActivityDesc
+        AVATAR -> strings.privacyAvatarDesc
+        FORWARDED -> strings.privacyForwardedDesc
+        MESSAGES -> strings.privacyMessagesDesc
+        STATUS -> strings.privacyStatusDesc
+    }
+
+    companion object {
+        fun byRoute(route: String): PrivacyField? = entries.firstOrNull { it.route == route }
+        fun bySelectRoute(route: String): PrivacyField? = entries.firstOrNull { it.selectRoute == route }
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/*  Parsing helpers                                                   */
+/* ------------------------------------------------------------------ */
+
+/**
+ * [PrivacyType.valueOf] used to be called directly on a value that comes from the
+ * server, so any unknown/empty mode crashed the whole settings screen.
+ */
+private fun privacyTypeOrDefault(raw: String?): PrivacyType =
+    PrivacyType.entries.firstOrNull { it.name.equals(raw?.trim().orEmpty(), ignoreCase = true) }
+        ?: PrivacyType.EVERYONE
+
+private fun parseIds(csv: String?): Set<Int> =
+    csv?.split(',')?.mapNotNull { it.trim().toIntOrNull() }?.toSet() ?: emptySet()
+
+private fun idsToCsv(ids: Iterable<Int>): String = ids.joinToString(",")
+
+/** Reads an id list from JSON properly instead of string-trimming brackets and quotes. */
+private fun JSONObject.idsCsv(key: String): String {
+    optJSONArray(key)?.let { array ->
+        val ids = ArrayList<Int>(array.length())
+        for (i in 0 until array.length()) {
+            val id = when (val value = array.opt(i)) {
+                is Number -> value.toInt()
+                is String -> value.trim().toIntOrNull()
+                else -> null
+            }
+            if (id != null) ids.add(id)
+        }
+        return idsToCsv(ids)
+    }
+    // Legacy payloads sent the array as a plain string.
+    return idsToCsv(parseIds(optString(key, "")))
+}
+
+/* ------------------------------------------------------------------ */
+/*  Navigation model                                                  */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Depth of a route, used to pick the slide direction.
+ *
+ * The old version relied on `startsWith("edit_") || startsWith("privacy_") && !...`,
+ * where `&&` binds tighter than `||`; the typed lookups below remove that trap.
+ */
+private fun screenLevel(screen: String): Int = when {
+    screen == ROUTE_MAIN -> 0
+    screen == ROUTE_PRIVACY || screen == ROUTE_ACCOUNT || screen == ROUTE_DEVICES || screen == ROUTE_VIBE_PRO -> 1
+    PrivacyField.bySelectRoute(screen) != null -> 3
+    PrivacyField.byRoute(screen) != null -> 2
+    screen == ROUTE_BLOCKED || screen == ROUTE_PASSCODE || screen == ROUTE_TWO_FACTOR -> 2
+    screen.startsWith(EDIT_PREFIX) -> 2
+    else -> 0
+}
+
+private fun parentRoute(screen: String): String = when {
+    PrivacyField.bySelectRoute(screen) != null -> PrivacyField.bySelectRoute(screen)!!.route
+    PrivacyField.byRoute(screen) != null -> ROUTE_PRIVACY
+    screen == ROUTE_BLOCKED || screen == ROUTE_PASSCODE || screen == ROUTE_TWO_FACTOR -> ROUTE_PRIVACY
+    screen == ROUTE_VIBE_PRO -> ROUTE_MAIN
+    screen.startsWith(EDIT_PREFIX) -> ROUTE_ACCOUNT
+    else -> ROUTE_MAIN
+}
+
+/* ------------------------------------------------------------------ */
+/*  Screen                                                           */
+/* ------------------------------------------------------------------ */
 
 @Composable
 fun SettingsScreen(
@@ -25,75 +219,44 @@ fun SettingsScreen(
     webSocket: VibeWebSocket,
     onLogout: () -> Unit,
     onNavigateToPasscodeSetup: () -> Unit,
-    onProfileClick: ((userId: Int, username: String) -> Unit)? = null
+    onProfileClick: ((userId: Int, username: String) -> Unit)? = null,
+    currentScreen: String = ROUTE_MAIN,
+    onCurrentScreenChange: (String) -> Unit = {}
 ) {
-    var currentScreen by remember { mutableStateOf("main") }
+    val strings = LocalVibeStrings.current
     val scope = rememberCoroutineScope()
-    val strings = com.flasskdev.vibe.ui.theme.LocalVibeStrings.current
 
     var blockedCount by remember { mutableIntStateOf(0) }
 
-    var tempPrivacyActivity by remember { mutableStateOf<PrivacyType?>(null) }
-    var tempPrivacyAvatar by remember { mutableStateOf<PrivacyType?>(null) }
-    var tempPrivacyForwarded by remember { mutableStateOf<PrivacyType?>(null) }
-    var tempPrivacyMessages by remember { mutableStateOf<PrivacyType?>(null) }
-    var tempPrivacyStatus by remember { mutableStateOf<PrivacyType?>(null) }
+    // One map instead of five `temp*` variables.
+    val pendingPrivacy = remember { mutableStateMapOf<PrivacyField, PrivacyType>() }
 
-    fun getScreenLevel(screen: String): Int = when {
-        screen == "main" -> 0
-        screen in listOf("privacy", "account", "devices") -> 1
-        screen == "blocked_users" -> 2
-        screen.startsWith("edit_") || screen.startsWith("privacy_") && !screen.startsWith("privacy_select_") -> 2
-        screen.startsWith("privacy_select_") -> 3
-        else -> 0
+    BackHandler(enabled = currentScreen != ROUTE_MAIN) {
+        // Leaving a privacy option screen discards its unsaved choice.
+        PrivacyField.byRoute(currentScreen)?.let { pendingPrivacy.remove(it) }
+        onCurrentScreenChange(parentRoute(currentScreen))
     }
 
-    BackHandler(enabled = currentScreen != "main") {
-        when {
-            currentScreen == "blocked_users" -> currentScreen = "privacy"
-            currentScreen.startsWith("edit_") -> currentScreen = "account"
-            currentScreen.startsWith("privacy_select_") -> currentScreen = currentScreen.replace("privacy_select_", "privacy_")
-            currentScreen.startsWith("privacy_") -> {
-                tempPrivacyActivity = null
-                tempPrivacyAvatar = null
-                tempPrivacyForwarded = null
-                tempPrivacyMessages = null
-                tempPrivacyStatus = null
-                currentScreen = "privacy"
+    fun pushPrivacySettings() {
+        val payload = JSONObject().apply {
+            PrivacyField.entries.forEach { field ->
+                put(field.jsonKey, field.mode(userPreferences))
+                put("${field.jsonKey}_users", JSONArray(parseIds(field.users(userPreferences)).toList()))
             }
-            else -> currentScreen = "main"
         }
+        webSocket.updatePrivacySettings(userPreferences.userId, payload)
     }
 
-    fun saveAllPrivacySettings() {
-        val settings = org.json.JSONObject().apply {
-            put("activity", userPreferences.privacyActivity)
-            put("activity_users", org.json.JSONArray(userPreferences.privacyActivityUsers.split(",").mapNotNull { it.trim().toIntOrNull() }))
-            put("avatar", userPreferences.privacyAvatar)
-            put("avatar_users", org.json.JSONArray(userPreferences.privacyAvatarUsers.split(",").mapNotNull { it.trim().toIntOrNull() }))
-            put("forwarded", userPreferences.privacyForwarded)
-            put("forwarded_users", org.json.JSONArray(userPreferences.privacyForwardedUsers.split(",").mapNotNull { it.trim().toIntOrNull() }))
-            put("messages", userPreferences.privacyMessages)
-            put("messages_users", org.json.JSONArray(userPreferences.privacyMessagesUsers.split(",").mapNotNull { it.trim().toIntOrNull() }))
-            put("status", userPreferences.privacyStatus)
-            put("status_users", org.json.JSONArray(userPreferences.privacyStatusUsers.split(",").mapNotNull { it.trim().toIntOrNull() }))
-        }
-        webSocket.updatePrivacySettings(userPreferences.userId, settings)
-    }
-
-    DisposableEffect(webSocket) {
-        val listener = object : com.flasskdev.vibe.data.VibeWebSocketListener {
-            override fun onPrivacySettingsResult(settings: org.json.JSONObject) {
-                userPreferences.privacyActivity = settings.optString("activity", "EVERYONE")
-                userPreferences.privacyActivityUsers = settings.optString("activity_users", "[]").trim('[', ']').replace("\"", "")
-                userPreferences.privacyAvatar = settings.optString("avatar", "EVERYONE")
-                userPreferences.privacyAvatarUsers = settings.optString("avatar_users", "[]").trim('[', ']').replace("\"", "")
-                userPreferences.privacyForwarded = settings.optString("forwarded", "EVERYONE")
-                userPreferences.privacyForwardedUsers = settings.optString("forwarded_users", "[]").trim('[', ']').replace("\"", "")
-                userPreferences.privacyMessages = settings.optString("messages", "EVERYONE")
-                userPreferences.privacyMessagesUsers = settings.optString("messages_users", "[]").trim('[', ']').replace("\"", "")
-                userPreferences.privacyStatus = settings.optString("status", "EVERYONE")
-                userPreferences.privacyStatusUsers = settings.optString("status_users", "[]").trim('[', ']').replace("\"", "")
+    DisposableEffect(webSocket, userPreferences.userId) {
+        val listener = object : VibeWebSocketListener {
+            override fun onPrivacySettingsResult(settings: JSONObject) {
+                PrivacyField.entries.forEach { field ->
+                    field.setMode(
+                        userPreferences,
+                        privacyTypeOrDefault(settings.optString(field.jsonKey, PrivacyType.EVERYONE.name)).name
+                    )
+                    field.setUsers(userPreferences, settings.idsCsv("${field.jsonKey}_users"))
+                }
             }
 
             override fun onBlockedCountResult(count: Int) {
@@ -117,372 +280,320 @@ fun SettingsScreen(
     Box(
         modifier = Modifier
             .fillMaxSize()
-            .liquefiable(liquidState)
+            .background(MaterialTheme.colorScheme.background)
     ) {
         AnimatedContent(
             targetState = currentScreen,
             transitionSpec = {
-                val targetLevel = getScreenLevel(targetState)
-                val initialLevel = getScreenLevel(initialState)
-                if (targetLevel > initialLevel) {
-                    slideInHorizontally(animationSpec = tween(300)) { width -> width } + fadeIn() togetherWith
-                            slideOutHorizontally(animationSpec = tween(300)) { width -> -width } + fadeOut()
-                } else {
-                    slideInHorizontally(animationSpec = tween(300)) { width -> -width } + fadeIn() togetherWith
-                            slideOutHorizontally(animationSpec = tween(300)) { width -> width } + fadeOut()
-                }
+                val forward = screenLevel(targetState) >= screenLevel(initialState)
+                // iOS-like push: the incoming screen travels the full width while the
+                // outgoing one only drifts a quarter, instead of both flying across.
+                val enter = slideInHorizontally(tween(320, easing = FastOutSlowInEasing)) { w ->
+                    if (forward) w else -w / 4
+                } + fadeIn(tween(220))
+                val exit = slideOutHorizontally(tween(320, easing = FastOutSlowInEasing)) { w ->
+                    if (forward) -w / 4 else w
+                } + fadeOut(tween(200))
+                ContentTransform(
+                    targetContentEnter = enter,
+                    initialContentExit = exit,
+                    targetContentZIndex = if (forward) 1f else 0f,
+                    sizeTransform = SizeTransform(clip = false)
+                )
             },
             label = "settings_navigation"
         ) { screen ->
-            when (screen) {
-                "main" -> MainSettingsContent(
-                    onNavigateToPrivacy = {
-                        webSocket.getBlockedCount(userPreferences.userId)
-                        currentScreen = "privacy"
-                    },
-                    onNavigateToAccount = { currentScreen = "account" },
-                    onNavigateToDevices = { currentScreen = "devices" }
-                )
-                "privacy" -> PrivacySettingsContent(
-                    onBack = { currentScreen = "main" },
+            val privacyField = PrivacyField.byRoute(screen)
+            val privacySelectField = PrivacyField.bySelectRoute(screen)
+
+            when {
+                screen == ROUTE_PRIVACY -> PrivacySettingsContent(
+                    onBack = { onCurrentScreenChange(ROUTE_MAIN) },
                     blockedCount = blockedCount,
-                    onNavigateToBlockedUsers = { currentScreen = "blocked_users" },
-                    onNavigateToPasscodeSetup = onNavigateToPasscodeSetup,
-                    onNavigateToActivity = { currentScreen = "privacy_activity" },
-                    onNavigateToAvatar = { currentScreen = "privacy_avatar" },
-                    onNavigateToForwarded = { currentScreen = "privacy_forwarded" },
-                    onNavigateToMessages = { currentScreen = "privacy_messages" },
-                    onNavigateToStatus = { currentScreen = "privacy_status" }
+                    twoFactorEnabled = userPreferences.twoFactorPassword != null,
+                    passcodeEnabled = userPreferences.passcode != null,
+                    onNavigateToBlockedUsers = { onCurrentScreenChange(ROUTE_BLOCKED) },
+                    onNavigateToTwoFactor = { onCurrentScreenChange(ROUTE_TWO_FACTOR) },
+                    onNavigateToPasscodeSetup = { onCurrentScreenChange(ROUTE_PASSCODE) },
+                    onNavigateToActivity = { onCurrentScreenChange(PrivacyField.ACTIVITY.route) },
+                    onNavigateToAvatar = { onCurrentScreenChange(PrivacyField.AVATAR.route) },
+                    onNavigateToForwarded = { onCurrentScreenChange(PrivacyField.FORWARDED.route) },
+                    onNavigateToMessages = { onCurrentScreenChange(PrivacyField.MESSAGES.route) },
+                    onNavigateToStatus = { onCurrentScreenChange(PrivacyField.STATUS.route) }
                 )
-                "blocked_users" -> BlockedUsersScreen(
+
+                screen == ROUTE_PASSCODE -> PasscodeSetupScreen(
+                    userPreferences = userPreferences,
+                    onBack = { onCurrentScreenChange(ROUTE_PRIVACY) }
+                )
+
+                screen == ROUTE_TWO_FACTOR -> TwoFactorSettingsContent(
+                    userPreferences = userPreferences,
+                    onBack = { onCurrentScreenChange(ROUTE_PRIVACY) }
+                )
+
+                screen == ROUTE_BLOCKED -> BlockedUsersScreen(
                     webSocket = webSocket,
                     onBack = {
                         webSocket.getBlockedCount(userPreferences.userId)
-                        currentScreen = "privacy"
+                        onCurrentScreenChange(ROUTE_PRIVACY)
                     },
-                    onProfileClick = { id, name ->
-                        onProfileClick?.invoke(id, name)
-                    }
+                    onProfileClick = { id, name -> onProfileClick?.invoke(id, name) }
                 )
-                "account" -> AccountSettingsContent(
+
+                screen == ROUTE_ACCOUNT -> AccountSettingsContent(
                     userPreferences = userPreferences,
                     webSocket = webSocket,
                     onLogout = onLogout,
-                    onNavigateToPrivacy = { currentScreen = "privacy" },
-                    onNavigateToEditUsername = { currentScreen = "edit_username" },
-                    onNavigateToEditNickname = { currentScreen = "edit_nickname" },
-                    onNavigateToEditBio = { currentScreen = "edit_bio" },
-                    onBack = { currentScreen = "main" }
+                    onNavigateToPrivacy = { onCurrentScreenChange(ROUTE_PRIVACY) },
+                    onNavigateToEditUsername = { onCurrentScreenChange(ROUTE_EDIT_USERNAME) },
+                    onNavigateToEditNickname = { onCurrentScreenChange(ROUTE_EDIT_NICKNAME) },
+                    onNavigateToEditBio = { onCurrentScreenChange(ROUTE_EDIT_BIO) },
+                    onBack = { onCurrentScreenChange(ROUTE_MAIN) }
                 )
-                "devices" -> DevicesScreenContent(
+
+                screen == ROUTE_DEVICES -> DevicesScreenContent(
                     webSocket = webSocket,
                     userPreferences = userPreferences,
-                    onBack = { currentScreen = "main" }
+                    onBack = { onCurrentScreenChange(ROUTE_MAIN) }
                 )
-                "edit_username" -> {
-                    val context = androidx.compose.ui.platform.LocalContext.current
-                    val db = remember { com.flasskdev.vibe.data.local.AppDatabase.getDatabase(context) }
-                    val user by db.chatDao().getUserById(userPreferences.userId).collectAsState(initial = null)
-                    
-                    var usernameError by remember { mutableStateOf<String?>(null) }
-                    var usernameSuccess by remember { mutableStateOf<String?>(null) }
-                    
-                    DisposableEffect(webSocket) {
-                        val listener = object : com.flasskdev.vibe.data.VibeWebSocketListener {
-                            override fun onAuthResponse(message: com.flasskdev.vibe.data.VibeMessage) {
-                                if (message.username_taken != null) {
-                                    if (message.username_taken == true) {
-                                        usernameError = strings.usernameTaken
-                                        usernameSuccess = null
-                                    } else {
-                                        usernameError = null
-                                        usernameSuccess = strings.usernameAvailable
-                                    }
-                                }
-                            }
-                        }
-                        webSocket.addListener(listener)
-                        onDispose { webSocket.removeListener(listener) }
-                    }
-                    
-                    EditProfileFieldContent(
-                        title = strings.usernameLabel,
-                        initialValue = user?.username ?: "",
-                        description = strings.usernameDescription,
-                        maxLength = 32,
-                        icon = Icons.Rounded.AlternateEmail,
-                        errorMessage = usernameError,
-                        successMessage = usernameSuccess,
-                        filter = { it ->
-                            var newUsername = it
-                            // Filter out non-English, non-digit, non-underscore
-                            newUsername = newUsername.filter { char -> char in 'a'..'z' || char in 'A'..'Z' || char in '0'..'9' || char == '_' }
-                            
-                            // Prevent starting with digit or underscore
-                            while (newUsername.isNotEmpty() && (newUsername.first().isDigit() || newUsername.first() == '_')) {
-                                newUsername = newUsername.drop(1)
-                            }
-                            
-                            // Prevent multiple underscores
-                            if (newUsername.count { c -> c == '_' } > 1) {
-                                val firstIndex = newUsername.indexOf('_')
-                                newUsername = newUsername.filterIndexed { index, c -> c != '_' || index == firstIndex }
-                            }
-                            newUsername
-                        },
-                        onValueChange = { newValue ->
-                            if (newValue.isNotEmpty() && newValue != user?.username) {
-                                usernameSuccess = null
-                                if (newValue.length < 4) {
-                                    usernameError = strings.usernameMinLength
-                                } else {
-                                    usernameError = null
-                                    webSocket.checkAvailability(email = "", username = newValue)
-                                }
-                            } else {
-                                usernameError = null
-                                usernameSuccess = null
-                            }
-                        },
-                        onSave = { newValue ->
-                            if (usernameError == null) {
-                                scope.launch(Dispatchers.IO) {
-                                    val currentUser = db.chatDao().getUserById(userPreferences.userId).firstOrNull()
-                                    if (currentUser != null) {
-                                        db.chatDao().insertUser(currentUser.copy(username = newValue))
-                                    }
-                                }
-                                webSocket.updateProfile(userId = userPreferences.userId, username = newValue)
-                                currentScreen = "account"
-                            }
-                        },
-                        onBack = { currentScreen = "account" }
-                    )
-                }
-                "edit_nickname" -> {
-                    val context = androidx.compose.ui.platform.LocalContext.current
-                    val db = remember { com.flasskdev.vibe.data.local.AppDatabase.getDatabase(context) }
-                    val user by db.chatDao().getUserById(userPreferences.userId).collectAsState(initial = null)
-                    
-                    EditProfileFieldContent(
-                        title = strings.nicknameLabel,
-                        initialValue = user?.name ?: "",
-                        description = strings.nicknameDescription,
-                        maxLength = 32,
-                        icon = Icons.Rounded.Person,
-                        onSave = { newValue ->
-                            scope.launch(Dispatchers.IO) {
-                                val currentUser = db.chatDao().getUserById(userPreferences.userId).firstOrNull()
-                                if (currentUser != null) {
-                                    db.chatDao().insertUser(currentUser.copy(name = newValue))
-                                }
-                            }
-                            webSocket.setNickname(email = "", nickname = newValue, userId = userPreferences.userId)
-                            currentScreen = "account"
-                        },
-                        onBack = { currentScreen = "account" }
-                    )
-                }
-                "edit_bio" -> {
-                    val context = androidx.compose.ui.platform.LocalContext.current
-                    val db = remember { com.flasskdev.vibe.data.local.AppDatabase.getDatabase(context) }
-                    val user by db.chatDao().getUserById(userPreferences.userId).collectAsState(initial = null)
-                    
-                    EditProfileFieldContent(
-                        title = strings.aboutLabel,
-                        initialValue = user?.about ?: "",
-                        description = strings.bioDescription,
-                        maxLength = 64,
-                        icon = Icons.Rounded.Info,
-                        onSave = { newValue ->
-                            scope.launch(Dispatchers.IO) {
-                                val currentUser = db.chatDao().getUserById(userPreferences.userId).firstOrNull()
-                                if (currentUser != null) {
-                                    db.chatDao().insertUser(currentUser.copy(about = newValue))
-                                }
-                            }
-                            webSocket.updateProfile(userId = userPreferences.userId, about = newValue)
-                            currentScreen = "account"
-                        },
-                        onBack = { currentScreen = "account" }
-                    )
-                }
-                "privacy_activity" -> {
-                    val count = userPreferences.privacyActivityUsers.split(",").filter { it.isNotEmpty() }.size
+
+                screen == ROUTE_EDIT_USERNAME -> EditUsernameRoute(
+                    userPreferences = userPreferences,
+                    webSocket = webSocket,
+                    strings = strings,
+                    onDone = { onCurrentScreenChange(ROUTE_ACCOUNT) }
+                )
+
+                screen == ROUTE_EDIT_NICKNAME -> EditNicknameRoute(
+                    userPreferences = userPreferences,
+                    webSocket = webSocket,
+                    strings = strings,
+                    onDone = { onCurrentScreenChange(ROUTE_ACCOUNT) }
+                )
+
+                screen == ROUTE_EDIT_BIO -> EditBioRoute(
+                    userPreferences = userPreferences,
+                    webSocket = webSocket,
+                    strings = strings,
+                    onDone = { onCurrentScreenChange(ROUTE_ACCOUNT) }
+                )
+
+                privacyField != null -> {
+                    val saved = privacyTypeOrDefault(privacyField.mode(userPreferences))
                     PrivacyOptionScreen(
-                        title = strings.privacyActivityTitle,
-                        description = strings.privacyActivityDesc,
-                        savedValue = PrivacyType.valueOf(userPreferences.privacyActivity),
-                        initialValue = tempPrivacyActivity ?: PrivacyType.valueOf(userPreferences.privacyActivity),
-                        selectedUsersCount = count,
-                        onValueChange = { tempPrivacyActivity = it },
-                        onNavigateToSelectUsers = { currentScreen = "privacy_select_activity" },
-                        onSave = { 
-                            userPreferences.privacyActivity = it.name
-                            saveAllPrivacySettings()
-                            tempPrivacyActivity = null
-                            currentScreen = "privacy"
+                        title = privacyField.title(strings),
+                        description = privacyField.description(strings),
+                        savedValue = saved,
+                        initialValue = pendingPrivacy[privacyField] ?: saved,
+                        selectedUsersCount = parseIds(privacyField.users(userPreferences)).size,
+                        onValueChange = { pendingPrivacy[privacyField] = it },
+                        onNavigateToSelectUsers = { onCurrentScreenChange(privacyField.selectRoute) },
+                        onSave = { value ->
+                            privacyField.setMode(userPreferences, value.name)
+                            pushPrivacySettings()
+                            pendingPrivacy.remove(privacyField)
+                            onCurrentScreenChange(ROUTE_PRIVACY)
                         },
-                        onBack = { 
-                            tempPrivacyActivity = null
-                            currentScreen = "privacy" 
+                        onBack = {
+                            pendingPrivacy.remove(privacyField)
+                            onCurrentScreenChange(ROUTE_PRIVACY)
                         }
                     )
                 }
-                "privacy_avatar" -> {
-                    val count = userPreferences.privacyAvatarUsers.split(",").filter { it.isNotEmpty() }.size
-                    PrivacyOptionScreen(
-                        title = strings.privacyAvatarTitle,
-                        description = strings.privacyAvatarDesc,
-                        savedValue = PrivacyType.valueOf(userPreferences.privacyAvatar),
-                        initialValue = tempPrivacyAvatar ?: PrivacyType.valueOf(userPreferences.privacyAvatar),
-                        selectedUsersCount = count,
-                        onValueChange = { tempPrivacyAvatar = it },
-                        onNavigateToSelectUsers = { currentScreen = "privacy_select_avatar" },
-                        onSave = { 
-                            userPreferences.privacyAvatar = it.name
-                            saveAllPrivacySettings()
-                            tempPrivacyAvatar = null
-                            currentScreen = "privacy"
-                        },
-                        onBack = { 
-                            tempPrivacyAvatar = null
-                            currentScreen = "privacy" 
-                        }
-                    )
-                }
-                "privacy_forwarded" -> {
-                    val count = userPreferences.privacyForwardedUsers.split(",").filter { it.isNotEmpty() }.size
-                    PrivacyOptionScreen(
-                        title = strings.privacyForwardedTitle,
-                        description = strings.privacyForwardedDesc,
-                        savedValue = PrivacyType.valueOf(userPreferences.privacyForwarded),
-                        initialValue = tempPrivacyForwarded ?: PrivacyType.valueOf(userPreferences.privacyForwarded),
-                        selectedUsersCount = count,
-                        onValueChange = { tempPrivacyForwarded = it },
-                        onNavigateToSelectUsers = { currentScreen = "privacy_select_forwarded" },
-                        onSave = { 
-                            userPreferences.privacyForwarded = it.name
-                            saveAllPrivacySettings()
-                            tempPrivacyForwarded = null
-                            currentScreen = "privacy"
-                        },
-                        onBack = { 
-                            tempPrivacyForwarded = null
-                            currentScreen = "privacy" 
-                        }
-                    )
-                }
-                "privacy_messages" -> {
-                    val count = userPreferences.privacyMessagesUsers.split(",").filter { it.isNotEmpty() }.size
-                    PrivacyOptionScreen(
-                        title = strings.privacyMessagesTitle,
-                        description = strings.privacyMessagesDesc,
-                        savedValue = PrivacyType.valueOf(userPreferences.privacyMessages),
-                        initialValue = tempPrivacyMessages ?: PrivacyType.valueOf(userPreferences.privacyMessages),
-                        selectedUsersCount = count,
-                        onValueChange = { tempPrivacyMessages = it },
-                        onNavigateToSelectUsers = { currentScreen = "privacy_select_messages" },
-                        onSave = { 
-                            userPreferences.privacyMessages = it.name
-                            saveAllPrivacySettings()
-                            tempPrivacyMessages = null
-                            currentScreen = "privacy"
-                        },
-                        onBack = { 
-                            tempPrivacyMessages = null
-                            currentScreen = "privacy" 
-                        }
-                    )
-                }
-                "privacy_status" -> {
-                    val count = userPreferences.privacyStatusUsers.split(",").filter { it.isNotEmpty() }.size
-                    PrivacyOptionScreen(
-                        title = strings.privacyStatusTitle,
-                        description = strings.privacyStatusDesc,
-                        savedValue = PrivacyType.valueOf(userPreferences.privacyStatus),
-                        initialValue = tempPrivacyStatus ?: PrivacyType.valueOf(userPreferences.privacyStatus),
-                        selectedUsersCount = count,
-                        onValueChange = { tempPrivacyStatus = it },
-                        onNavigateToSelectUsers = { currentScreen = "privacy_select_status" },
-                        onSave = { 
-                            userPreferences.privacyStatus = it.name
-                            saveAllPrivacySettings()
-                            tempPrivacyStatus = null
-                            currentScreen = "privacy"
-                        },
-                        onBack = { 
-                            tempPrivacyStatus = null
-                            currentScreen = "privacy" 
-                        }
-                    )
-                }
-                "privacy_select_activity" -> {
-                    val currentIds = userPreferences.privacyActivityUsers.split(",").filter { it.isNotEmpty() }.mapNotNull { it.toIntOrNull() }.toSet()
-                    SelectPrivacyUsersScreen(
-                        selectedUserIds = currentIds,
-                        onUsersSelected = { set -> 
-                            tempPrivacyActivity = PrivacyType.SELECTED
-                            userPreferences.privacyActivity = PrivacyType.SELECTED.name
-                            userPreferences.privacyActivityUsers = set.joinToString(",")
-                            saveAllPrivacySettings()
-                        },
-                        onBack = { currentScreen = "privacy_activity" }
-                    )
-                }
-                "privacy_select_avatar" -> {
-                    val currentIds = userPreferences.privacyAvatarUsers.split(",").filter { it.isNotEmpty() }.mapNotNull { it.toIntOrNull() }.toSet()
-                    SelectPrivacyUsersScreen(
-                        selectedUserIds = currentIds,
-                        onUsersSelected = { set -> 
-                            tempPrivacyAvatar = PrivacyType.SELECTED
-                            userPreferences.privacyAvatar = PrivacyType.SELECTED.name
-                            userPreferences.privacyAvatarUsers = set.joinToString(",")
-                            saveAllPrivacySettings()
-                        },
-                        onBack = { currentScreen = "privacy_avatar" }
-                    )
-                }
-                "privacy_select_forwarded" -> {
-                    val currentIds = userPreferences.privacyForwardedUsers.split(",").filter { it.isNotEmpty() }.mapNotNull { it.toIntOrNull() }.toSet()
-                    SelectPrivacyUsersScreen(
-                        selectedUserIds = currentIds,
-                        onUsersSelected = { set -> 
-                            tempPrivacyForwarded = PrivacyType.SELECTED
-                            userPreferences.privacyForwarded = PrivacyType.SELECTED.name
-                            userPreferences.privacyForwardedUsers = set.joinToString(",")
-                            saveAllPrivacySettings()
-                        },
-                        onBack = { currentScreen = "privacy_forwarded" }
-                    )
-                }
-                "privacy_select_messages" -> {
-                    val currentIds = userPreferences.privacyMessagesUsers.split(",").filter { it.isNotEmpty() }.mapNotNull { it.toIntOrNull() }.toSet()
-                    SelectPrivacyUsersScreen(
-                        selectedUserIds = currentIds,
-                        onUsersSelected = { set -> 
-                            tempPrivacyMessages = PrivacyType.SELECTED
-                            userPreferences.privacyMessages = PrivacyType.SELECTED.name
-                            userPreferences.privacyMessagesUsers = set.joinToString(",")
-                            saveAllPrivacySettings()
-                        },
-                        onBack = { currentScreen = "privacy_messages" }
-                    )
-                }
-                "privacy_select_status" -> {
-                    val currentIds = userPreferences.privacyStatusUsers.split(",").filter { it.isNotEmpty() }.mapNotNull { it.toIntOrNull() }.toSet()
-                    SelectPrivacyUsersScreen(
-                        selectedUserIds = currentIds,
-                        onUsersSelected = { set -> 
-                            tempPrivacyStatus = PrivacyType.SELECTED
-                            userPreferences.privacyStatus = PrivacyType.SELECTED.name
-                            userPreferences.privacyStatusUsers = set.joinToString(",")
-                            saveAllPrivacySettings()
-                        },
-                        onBack = { currentScreen = "privacy_status" }
-                    )
-                }
+
+                privacySelectField != null -> SelectPrivacyUsersScreen(
+                    selectedUserIds = parseIds(privacySelectField.users(userPreferences)),
+                    onUsersSelected = { ids ->
+                        pendingPrivacy[privacySelectField] = PrivacyType.SELECTED
+                        privacySelectField.setMode(userPreferences, PrivacyType.SELECTED.name)
+                        privacySelectField.setUsers(userPreferences, idsToCsv(ids))
+                        pushPrivacySettings()
+                    },
+                    onBack = { onCurrentScreenChange(privacySelectField.route) }
+                )
+
+                screen == ROUTE_VIBE_PRO -> VibeProScreenContent(
+                    onBack = { onCurrentScreenChange(ROUTE_MAIN) }
+                )
+
+                // ROUTE_MAIN and anything unknown: never leave a blank screen.
+                else -> MainSettingsContent(
+                    onNavigateToPrivacy = {
+                        webSocket.getBlockedCount(userPreferences.userId)
+                        onCurrentScreenChange(ROUTE_PRIVACY)
+                    },
+                    onNavigateToAccount = { onCurrentScreenChange(ROUTE_ACCOUNT) },
+                    onNavigateToDevices = { onCurrentScreenChange(ROUTE_DEVICES) },
+                    onNavigateToVibePro = { onCurrentScreenChange(ROUTE_VIBE_PRO) }
+                )
             }
         }
     }
+}
+
+/* ------------------------------------------------------------------ */
+/*  Profile field routes                                              */
+/* ------------------------------------------------------------------ */
+
+@Composable
+private fun rememberCachedUser(userId: Int): State<UserCacheEntity?> {
+    val context = LocalContext.current
+    val db = remember(context) { AppDatabase.getDatabase(context) }
+    return remember(db, userId) { db.chatDao().getUserById(userId) }
+        .collectAsState(initial = null)
+}
+
+@Composable
+private fun EditUsernameRoute(
+    userPreferences: UserPreferences,
+    webSocket: VibeWebSocket,
+    strings: VibeStrings,
+    onDone: () -> Unit
+) {
+    val context = LocalContext.current
+    val db = remember(context) { AppDatabase.getDatabase(context) }
+    val scope = rememberCoroutineScope()
+    val user by rememberCachedUser(userPreferences.userId)
+
+    var usernameError by remember { mutableStateOf<String?>(null) }
+    var usernameSuccess by remember { mutableStateOf<String?>(null) }
+    var checkJob by remember { mutableStateOf<Job?>(null) }
+
+    DisposableEffect(webSocket) {
+        val listener = object : VibeWebSocketListener {
+            override fun onAuthResponse(message: VibeMessage) {
+                when (message.username_taken) {
+                    true -> {
+                        usernameError = strings.usernameTaken
+                        usernameSuccess = null
+                    }
+                    false -> {
+                        usernameError = null
+                        usernameSuccess = strings.usernameAvailable
+                    }
+                    null -> Unit
+                }
+            }
+        }
+        webSocket.addListener(listener)
+        onDispose {
+            webSocket.removeListener(listener)
+            checkJob?.cancel()
+        }
+    }
+
+    EditProfileFieldContent(
+        title = strings.usernameLabel,
+        initialValue = user?.username ?: "",
+        description = strings.usernameDescription,
+        maxLength = 32,
+        icon = Icons.Rounded.AlternateEmail,
+        errorMessage = usernameError,
+        successMessage = usernameSuccess,
+        filter = ::sanitizeUsername,
+        onValueChange = { newValue ->
+            checkJob?.cancel()
+            usernameSuccess = null
+            when {
+                newValue.isEmpty() || newValue == user?.username -> usernameError = null
+                newValue.length < USERNAME_MIN_LENGTH -> usernameError = strings.usernameMinLength
+                else -> {
+                    usernameError = null
+                    // Debounced so typing does not fire one socket call per keystroke.
+                    checkJob = scope.launch {
+                        delay(USERNAME_CHECK_DEBOUNCE_MS)
+                        webSocket.checkAvailability(email = "", username = newValue)
+                    }
+                }
+            }
+        },
+        onSave = { newValue ->
+            if (usernameError == null && newValue.length >= USERNAME_MIN_LENGTH) {
+                scope.launch(Dispatchers.IO) {
+                    db.chatDao().getUserById(userPreferences.userId).firstOrNull()?.let { cached ->
+                        db.chatDao().insertUser(cached.copy(username = newValue))
+                    }
+                }
+                webSocket.updateProfile(userId = userPreferences.userId, username = newValue)
+                onDone()
+            }
+        },
+        onBack = onDone
+    )
+}
+
+@Composable
+private fun EditNicknameRoute(
+    userPreferences: UserPreferences,
+    webSocket: VibeWebSocket,
+    strings: VibeStrings,
+    onDone: () -> Unit
+) {
+    val context = LocalContext.current
+    val db = remember(context) { AppDatabase.getDatabase(context) }
+    val scope = rememberCoroutineScope()
+    val user by rememberCachedUser(userPreferences.userId)
+
+    EditProfileFieldContent(
+        title = strings.nicknameLabel,
+        initialValue = user?.name ?: "",
+        description = strings.nicknameDescription,
+        maxLength = 32,
+        icon = Icons.Rounded.Person,
+        onSave = { newValue ->
+            scope.launch(Dispatchers.IO) {
+                db.chatDao().getUserById(userPreferences.userId).firstOrNull()?.let { cached ->
+                    db.chatDao().insertUser(cached.copy(name = newValue))
+                }
+            }
+            webSocket.setNickname(email = "", nickname = newValue, userId = userPreferences.userId)
+            onDone()
+        },
+        onBack = onDone
+    )
+}
+
+@Composable
+private fun EditBioRoute(
+    userPreferences: UserPreferences,
+    webSocket: VibeWebSocket,
+    strings: VibeStrings,
+    onDone: () -> Unit
+) {
+    val context = LocalContext.current
+    val db = remember(context) { AppDatabase.getDatabase(context) }
+    val scope = rememberCoroutineScope()
+    val user by rememberCachedUser(userPreferences.userId)
+
+    EditProfileFieldContent(
+        title = strings.aboutLabel,
+        initialValue = user?.about ?: "",
+        description = strings.bioDescription,
+        maxLength = 64,
+        icon = Icons.Rounded.Info,
+        onSave = { newValue ->
+            scope.launch(Dispatchers.IO) {
+                db.chatDao().getUserById(userPreferences.userId).firstOrNull()?.let { cached ->
+                    db.chatDao().insertUser(cached.copy(about = newValue))
+                }
+            }
+            webSocket.updateProfile(userId = userPreferences.userId, about = newValue)
+            onDone()
+        },
+        onBack = onDone
+    )
+}
+
+/**
+ * Latin letters, digits and a single underscore; cannot start with a digit or `_`.
+ */
+private fun sanitizeUsername(input: String): String {
+    var result = input.filter { it in 'a'..'z' || it in 'A'..'Z' || it in '0'..'9' || it == '_' }
+    result = result.dropWhile { it.isDigit() || it == '_' }
+    val firstUnderscore = result.indexOf('_')
+    if (firstUnderscore >= 0) {
+        result = result.filterIndexed { index, c -> c != '_' || index == firstUnderscore }
+    }
+    return result
 }

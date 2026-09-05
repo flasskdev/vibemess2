@@ -168,19 +168,32 @@ object AttachmentUtils {
         }
     }
 
+    /**
+     * PERF: размер файла запрашивался HEAD-ом на КАЖДУЮ композицию баббла с файлом
+     * (вход в чат, скролл, поворот). Десяток файловых сообщений = десяток сетевых
+     * запросов на входе в переписку. Теперь результат кэшируется на процесс.
+     */
+    private val fileSizeCache = java.util.Collections.synchronizedMap(
+        object : LinkedHashMap<String, String>(64, 0.75f, true) {
+            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, String>?): Boolean = size > 300
+        }
+    )
+
     suspend fun getFileSizeAsync(url: String): String = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+        fileSizeCache[url]?.let { return@withContext it }
         try {
             if (url.startsWith("/") || url.startsWith("content://") || url.contains("cacheDir")) {
                 val file = java.io.File(url)
                 if (file.exists()) {
-                    return@withContext formatFileSize(file.length())
+                    return@withContext formatFileSize(file.length()).also { fileSizeCache[url] = it }
                 }
             } else {
                 val connection = java.net.URL(url).openConnection() as java.net.HttpURLConnection
                 connection.requestMethod = "HEAD"
                 val size = connection.contentLengthLong
+                connection.disconnect()
                 if (size > 0) {
-                    return@withContext formatFileSize(size)
+                    return@withContext formatFileSize(size).also { fileSizeCache[url] = it }
                 }
             }
         } catch (e: Exception) {

@@ -3,13 +3,13 @@ package com.flasskdev.vibe.utils
 object MessageUtils {
     fun formatMessagePreview(content: String, attachments: List<String>?): String {
         val hasAttachments = !attachments.isNullOrEmpty()
-        
+
         // System messages
         if (content.startsWith("\$\$SYSTEM\$\$PINNED_MESSAGE|")) {
             val parts = content.substringAfter("\$\$SYSTEM\$\$PINNED_MESSAGE|").split("|")
             val senderN = parts.getOrNull(0) ?: "Someone"
             val msgContent = parts.getOrNull(1) ?: ""
-            return "$senderN закрепил(а) сообщение: \"$msgContent\"" 
+            return "$senderN закрепил(а) сообщение: \"$msgContent\""
         }
 
         // Video messages (кружочки)
@@ -32,8 +32,8 @@ object MessageUtils {
         }
 
         // Voice messages
-        val isVoiceMessage = content.startsWith("duration:") || 
-                             (hasAttachments && attachments!![0].let { it.endsWith(".m4a") || it.endsWith(".mp3") } && content.startsWith("duration:"))
+        val isVoiceMessage = content.startsWith("duration:") ||
+                (hasAttachments && attachments!![0].let { it.endsWith(".m4a") || it.endsWith(".mp3") } && content.startsWith("duration:"))
         if (content.startsWith("duration:")) {
             val ms = content.substringAfter("duration:").toLongOrNull() ?: 0L
             val totalSeconds = ms / 1000
@@ -42,18 +42,18 @@ object MessageUtils {
             return "🎤 Голосовое сообщение ${String.format("%d:%02d", minutes, seconds)}"
         }
 
-        
+
         if (hasAttachments) {
             val images = attachments!!.filter { AttachmentUtils.isImage(it) }
             val videos = attachments.filter { AttachmentUtils.isPlayableVideo(it) }
             val audios = attachments.filter { AttachmentUtils.isPlayableAudio(it) }
-            val files = attachments.filter { 
-                !AttachmentUtils.isImage(it) && !AttachmentUtils.isPlayableVideo(it) && !AttachmentUtils.isPlayableAudio(it) 
+            val files = attachments.filter {
+                !AttachmentUtils.isImage(it) && !AttachmentUtils.isPlayableVideo(it) && !AttachmentUtils.isPlayableAudio(it)
             }
-            
+
             val hasCaption = content.isNotBlank()
             val count = attachments.size
-            
+
             // Single attachment
             if (count == 1) {
                 val att = attachments[0]
@@ -70,44 +70,44 @@ object MessageUtils {
                     }
                 }
             }
-            
+
             // Multiple attachments - mixed types
             if (images.isNotEmpty() && videos.isNotEmpty()) {
                 // Media album (photos + videos)
                 val mediaCount = images.size + videos.size
                 return if (hasCaption) "+${mediaCount - 1} $content" else formatMediaCount(mediaCount)
             }
-            
+
             if (images.isNotEmpty() && videos.isEmpty() && audios.isEmpty() && files.isEmpty()) {
                 // Only photos
                 val rem = count - 1
                 val suffix = formatPhotoSuffix(rem)
                 return if (hasCaption) "+$rem $content" else "+$rem $suffix"
             }
-            
+
             if (videos.isNotEmpty() && images.isEmpty() && audios.isEmpty() && files.isEmpty()) {
                 // Only videos
                 val rem = count - 1
                 return if (hasCaption) "+$rem $content" else formatVideoCount(count)
             }
-            
+
             if (audios.isNotEmpty() && images.isEmpty() && videos.isEmpty() && files.isEmpty()) {
                 // Only audio
                 return if (hasCaption) "🎵 $content" else "🎵 ${count} аудиофайлов"
             }
-            
+
             if (files.isNotEmpty() && images.isEmpty() && videos.isEmpty() && audios.isEmpty()) {
                 // Only files
                 return if (hasCaption) "📎 $content" else "📎 ${count} файлов"
             }
-            
+
             // Mixed types
             return if (hasCaption) "+${count - 1} $content" else "+${count - 1} вложений"
         }
-        
+
         return content
     }
-    
+
     private fun formatPhotoSuffix(count: Int): String {
         return when {
             count % 10 == 1 && count % 100 != 11 -> "фотография"
@@ -115,7 +115,7 @@ object MessageUtils {
             else -> "фотографий"
         }
     }
-    
+
     private fun formatMediaCount(count: Int): String {
         val suffix = when {
             count % 10 == 1 && count % 100 != 11 -> "медиафайл"
@@ -124,7 +124,7 @@ object MessageUtils {
         }
         return "🖼 $count $suffix"
     }
-    
+
     private fun formatVideoCount(count: Int): String {
         val suffix = when {
             count % 10 == 1 && count % 100 != 11 -> "видео"

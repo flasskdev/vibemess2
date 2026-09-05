@@ -16,6 +16,60 @@ import kotlinx.coroutines.withContext
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.Immutable
+
+/**
+ * Единый снапшот списка сообщений для UI.
+ *
+ * PERF: раньше messages и groupedMessages были двумя независимыми StateFlow с разным
+ * таймингом (groupedMessages ехал через flowOn(Default)). Каждое изменение сообщений
+ * давало два прохода рекомпозиции ChatScreen, плюс существовал кадр, в котором
+ * messages уже непустой, а grouped ещё пустой: LazyColumn собирался с нуля дважды.
+ * Карты byId и lazyIndex вдобавок строились на main thread прямо в композиции.
+ * Теперь всё считается один раз в Dispatchers.Default и приезжает одной эмиссией.
+ */
+@Immutable
+data class ChatListSnapshot(
+    val messages: List<MessageEntity>,
+    val grouped: Map<Long, List<MessageEntity>>,
+    val byId: Map<Int, MessageEntity>,
+    /** id сообщения -> его позиция в LazyColumn (с учётом разделителей дат). */
+    val lazyIndex: Map<Int, Int>
+) {
+    companion object {
+        val Empty = ChatListSnapshot(emptyList(), emptyMap(), emptyMap(), emptyMap())
+    }
+}
+
+private fun buildChatListSnapshot(list: List<MessageEntity>): ChatListSnapshot {
+    if (list.isEmpty()) return ChatListSnapshot.Empty
+
+    val tzOffset = java.util.TimeZone.getDefault().rawOffset.toLong()
+    val dayMillis = 86_400_000L
+    val grouped = list.asReversed().groupBy { message ->
+        ((message.timestamp + tzOffset) / dayMillis) * dayMillis - tzOffset
+    }
+
+    val byId = HashMap<Int, MessageEntity>(list.size)
+    for (message in list) byId[message.id] = message
+
+    val lazyIndex = HashMap<Int, Int>(list.size)
+    var index = 0
+    for ((_, messagesInDay) in grouped) {
+        for (message in messagesInDay) {
+            lazyIndex[message.id] = index
+            index++
+        }
+        index++ // разделитель даты
+    }
+
+    return ChatListSnapshot(
+        messages = list,
+        grouped = grouped,
+        byId = byId,
+        lazyIndex = lazyIndex
+    )
+}
 
 data class ReactionSheetData(
     val message: MessageEntity,
@@ -59,6 +113,42 @@ private object PendingInlineCallbackStore {
 }
 
 class ChatScreenViewModel(application: Application) : AndroidViewModel(application) {
+
+    companion object {
+        /** Размер окна сообщений. Первый экран должен быть маленьким: чем меньше бабблов
+         *  композится при входе, тем короче фриз на старте. */
+        // Совпадает с серверной страницей. Раньше здесь было 20 при 50 на сервере: localCount
+        // всегда оказывался больше нового лимита, из-за чего окно раздувалось без запросов.
+        private const val MESSAGES_PAGE_SIZE = 50
+
+        /**
+         * PERF: сколько сообщений уходит в UI на ПЕРВЫЙ кадр.
+         *
+         * Первая композиция чата — самая дорогая в процессе: под каждый баббл грузятся
+         * и JIT-компилируются классы, парсится форматирование текста, считается раскладка.
+         * 50 бабблов на первом кадре на холодном процессе и дают тот самый фриз, из-за
+         * которого клавиатура не может выехать. 15 хватает, чтобы заполнить экран; окно
+         * расширяется до полной страницы сразу после первого кадра.
+         */
+        private const val FIRST_PAGE_SIZE = 15
+
+        /** Пауза перед расширением окна до полной страницы — один кадр с запасом. */
+        private const val FIRST_PAGE_EXPAND_DELAY_MS = 120L
+
+        /**
+         * Пауза перед сетевым запросом истории при входе в чат. Локальный кэш Room
+         * рисуется мгновенно; ответ сервера почти всегда совпадает с кэшем, но его
+         * разбор и запись в Room раньше приходились ровно на анимацию открытия экрана.
+         */
+        private const val INITIAL_NETWORK_LOAD_DELAY_MS = 250L
+
+        private val timestampFormatter = ThreadLocal.withInitial {
+            java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", java.util.Locale.US).apply {
+                timeZone = java.util.TimeZone.getTimeZone("Europe/Paris")
+            }
+        }
+    }
+
     private val db = AppDatabase.getDatabase(application)
     private val chatDao = db.chatDao()
     private val userPrefs = UserPreferences(application)
@@ -80,39 +170,22 @@ class ChatScreenViewModel(application: Application) : AndroidViewModel(applicati
     private val _messages = MutableStateFlow<List<MessageEntity>>(emptyList())
     val messages: StateFlow<List<MessageEntity>> = _messages.asStateFlow()
 
-    val groupedMessages: StateFlow<Map<Long, List<MessageEntity>>> = messages
-        .map { list ->
-            val reversed = list.reversed()
-            val tzOffset = java.util.TimeZone.getDefault().rawOffset.toLong()
-            val dayMillis = 86400000L
-            reversed.groupBy { message ->
-                ((message.timestamp + tzOffset) / dayMillis) * dayMillis - tzOffset
-            }
-        }
+    /**
+     * Единственный источник истины для списка: сообщения, группировка по дням,
+     * карта id -> сообщение и карта id -> индекс в LazyColumn. Одна эмиссия = одна
+     * рекомпозиция. Заменяет прежние groupedMessages / messageFlatIndex и ручную
+     * сборку messagesById / messageLazyIndex в композиции.
+     */
+    val listSnapshot: StateFlow<ChatListSnapshot> = _messages
+        .map { list -> buildChatListSnapshot(list) }
         .flowOn(Dispatchers.Default)
-        .stateIn(viewModelScope, SharingStarted.Lazily, emptyMap())
-
-    val messageFlatIndex: StateFlow<Map<Int, Int>> = groupedMessages
-        .map { groups ->
-            var index = 0
-            val map = mutableMapOf<Int, Int>()
-            groups.forEach { (_, msgs) ->
-                msgs.forEach { m ->
-                    map[m.id] = index
-                    index++
-                }
-                index++ // date header
-            }
-            map
-        }
-        .flowOn(Dispatchers.Default)
-        .stateIn(viewModelScope, SharingStarted.Lazily, emptyMap())
+        .stateIn(viewModelScope, SharingStarted.Eagerly, ChatListSnapshot.Empty)
 
     var isContextMode by mutableStateOf(false)
         private set
     private var isResettingToBottom = false
 
-    private val _messageLimit = MutableStateFlow(15)
+    private val _messageLimit = MutableStateFlow(FIRST_PAGE_SIZE)
     private var isReachedEnd = false
     private var isLoadingMore = false
 
@@ -132,11 +205,14 @@ class ChatScreenViewModel(application: Application) : AndroidViewModel(applicati
     private var typingTimeoutJob: Job? = null
     private var isCurrentlyTyping = false
     private var messagesFlowJob: Job? = null
+    private var initialLoadJob: Job? = null
+    private var firstPageExpandJob: Job? = null
+    private var loadMoreWatchdogJob: Job? = null
     private var partnerUserJob: Job? = null
     private val pendingInlineCallbackTimeoutJobs = mutableMapOf<Int, Job>()
-    
+
     private var lastTypingTime = 0L
-    
+
     // Tracks IDs of messages already sent to the server to prevent duplicates
     private val processedUploadIds = mutableSetOf<Int>()
 
@@ -166,20 +242,20 @@ class ChatScreenViewModel(application: Application) : AndroidViewModel(applicati
     val searchResults: StateFlow<List<MessageEntity>> = combine(_partnerId, _searchQuery) { partnerId, query ->
         Pair(partnerId, query)
     }
-    .debounce(250)
-    .flatMapLatest { (partnerId, query) ->
-        if (query.isBlank() || partnerId <= 0) {
-            flowOf(emptyList())
-        } else {
-            chatDao.searchMessagesInChat(myUserId, partnerId, query.trim())
+        .debounce(250)
+        .flatMapLatest { (partnerId, query) ->
+            if (query.isBlank() || partnerId <= 0) {
+                flowOf(emptyList())
+            } else {
+                chatDao.searchMessagesInChat(myUserId, partnerId, query.trim())
+            }
         }
-    }
-    .flowOn(Dispatchers.IO)
-    .stateIn(
-        scope = viewModelScope,
-        started = SharingStarted.Lazily,
-        initialValue = emptyList()
-    )
+        .flowOn(Dispatchers.IO)
+        .stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.Lazily,
+            initialValue = emptyList()
+        )
 
     // Полный список чатов с JOIN нужен только для шторки "переслать". Держать его
     // подписанным всё время жизни ViewModel (Lazily) значило пересобирать JOIN при
@@ -266,7 +342,7 @@ class ChatScreenViewModel(application: Application) : AndroidViewModel(applicati
         override fun onMessagesDeleted(messageIds: List<Int>) {
             viewModelScope.launch(Dispatchers.IO) {
                 chatDao.deleteMessagesByIds(messageIds)
-                
+
                 _pinnedMessages.update { current ->
                     val currentList = current.toMutableList()
                     val initialSize = currentList.size
@@ -331,6 +407,7 @@ class ChatScreenViewModel(application: Application) : AndroidViewModel(applicati
                 isReachedEnd = true
             }
             isLoadingMore = false
+            loadMoreWatchdogJob?.cancel()
             viewModelScope.launch(Dispatchers.IO) {
                 val entities = messages.map { msg ->
                     MessageEntity(
@@ -585,7 +662,10 @@ class ChatScreenViewModel(application: Application) : AndroidViewModel(applicati
                 list.add(
                     com.flasskdev.vibe.data.ReactionUserDetail(
                         userId = uid,
-                        name = u?.name ?: if (uid == myUserId) "Вы" else "Пользователь #$uid",
+                        name = u?.name ?: run {
+                            val s = com.flasskdev.vibe.ui.theme.VibeStringsHolder.current
+                            if (uid == myUserId) s.you else s.userFallback(uid)
+                        },
                         username = u?.username,
                         avatarUrl = u?.avatarUrl,
                         emoji = r.emoji,
@@ -703,7 +783,7 @@ class ChatScreenViewModel(application: Application) : AndroidViewModel(applicati
         webSocket = ws
         ws.addListener(wsListener)
         refreshUserInfo(force = true)
-        
+
         viewModelScope.launch(Dispatchers.IO) {
             val me = chatDao.getUserByIdSync(myUserId)
             if (me != null && _myAvatarUrl.value != me.avatarUrl) {
@@ -711,15 +791,27 @@ class ChatScreenViewModel(application: Application) : AndroidViewModel(applicati
             }
         }
 
-        _messageLimit.value = 15
+        // PERF: стартуем с маленького окна, расширяем после первого кадра (см. ниже).
+        _messageLimit.value = FIRST_PAGE_SIZE
         isReachedEnd = false
+        isLoadingMore = false
+        loadMoreWatchdogJob?.cancel()
+        lastMarkedReadId = -1
         // Keep an unexpired callback wait when this destination is recreated for the same chat.
         restorePendingInlineCallbacks(partnerId)
         // The screen ViewModel can outlive a navigation transition; never leak pin state into another chat.
         _pinnedMessages.value = emptyList()
         _currentPinnedIndex.value = 0
         _highlightedMessageId.value = null
-        ws.loadMessages(myUserId, partnerId, offset = 0)
+
+        // PERF: сеть — после того, как локальный кэш отрисован. Раньше ответ сервера
+        // (разбор JSON + запись в Room + инвалидация Flow + пересборка LazyColumn)
+        // прилетал прямо во время анимации открытия чата.
+        initialLoadJob?.cancel()
+        initialLoadJob = viewModelScope.launch {
+            delay(INITIAL_NETWORK_LOAD_DELAY_MS)
+            ws.loadMessages(myUserId, partnerId, offset = 0)
+        }
 
         // Подписываемся на локальные сообщения из Room
         messagesFlowJob?.cancel()
@@ -732,7 +824,7 @@ class ChatScreenViewModel(application: Application) : AndroidViewModel(applicati
                 .flowOn(Dispatchers.IO) // Обработка БД в IO потоке
                 .collect { msgs ->
                     _messages.value = msgs
-                    
+
                     val pendingUploads = msgs.filter { it.uploadStatus == "SUCCESS" && it.senderId == myUserId && !processedUploadIds.contains(it.id) }
                     if (pendingUploads.isNotEmpty()) {
                         pendingUploads.forEach { processedUploadIds.add(it.id) }
@@ -752,6 +844,17 @@ class ChatScreenViewModel(application: Application) : AndroidViewModel(applicati
                 }
         }
 
+        // PERF: после первого кадра окно расширяется до полной страницы. Один лишний
+        // SELECT с LIMIT 50 стоит копейки, а первая (самая дорогая) композиция чата
+        // получает 15 бабблов вместо 50.
+        firstPageExpandJob?.cancel()
+        firstPageExpandJob = viewModelScope.launch {
+            delay(FIRST_PAGE_EXPAND_DELAY_MS)
+            if (_messageLimit.value == FIRST_PAGE_SIZE) {
+                _messageLimit.value = MESSAGES_PAGE_SIZE
+            }
+        }
+
         // Подписываемся на юзера, чтобы получить статус онлайна и статус блокировки
         partnerUserJob?.cancel()
         partnerUserJob = viewModelScope.launch(Dispatchers.IO) {
@@ -769,15 +872,39 @@ class ChatScreenViewModel(application: Application) : AndroidViewModel(applicati
         }
     }
 
+    /**
+     * PERF: главный источник фриза при входе в чат.
+     *
+     * Раньше `_messageLimit` увеличивался БЕЗУСЛОВНО, ещё до проверки локального
+     * количества, а ранний `return` не выставлял `isLoadingMore`. Смена лимита дёргает
+     * flatMapLatest -> отмена старого Room-Flow -> новый SELECT с новым LIMIT -> новый
+     * инстанс списка -> пересборка LazyColumn -> новый layoutInfo -> snapshotFlow в
+     * ChatScreen снова вызывал loadMoreMessages(). Получался каскад 20 -> 40 -> 60 -> ...
+     * до конца истории: десятки запросов в Room и в сокет за пару секунд, main thread
+     * забит, клавиатура не может выехать. На пустом чате каскад не стартовал вообще.
+     *
+     * Теперь окно расширяется только когда локальные сообщения реально исчерпаны, и
+     * ровно один запрос за раз.
+     */
     fun loadMoreMessages() {
         if (isLoadingMore || isReachedEnd) return
+
+        val localCount = _messages.value.size
+        // Пока на экран не отдано всё, что уже лежит в Room, лимит не трогаем:
+        // иначе меняется ключ flatMapLatest и список пересобирается впустую.
+        if (localCount < _messageLimit.value) return
+
         isLoadingMore = true
-        val currentLimit = _messageLimit.value
-        val newLimit = currentLimit + 15
-        _messageLimit.value = newLimit
-        
-        // Загружаем с сервера следующий кусок
-        webSocket?.loadMessages(myUserId, _partnerId.value, offset = currentLimit)
+        _messageLimit.value = localCount + MESSAGES_PAGE_SIZE
+        webSocket?.loadMessages(myUserId, _partnerId.value, offset = localCount)
+
+        // Без ответа сервера (обрыв сокета) isLoadingMore иначе залипает навсегда
+        // и подгрузка старых сообщений умирает до перезахода в чат.
+        loadMoreWatchdogJob?.cancel()
+        loadMoreWatchdogJob = viewModelScope.launch {
+            delay(10_000)
+            isLoadingMore = false
+        }
     }
 
     fun replyToMessage(msg: MessageEntity) {
@@ -800,22 +927,25 @@ class ChatScreenViewModel(application: Application) : AndroidViewModel(applicati
         _editingMessage.value = null
     }
 
+    private var lastMarkedReadId = -1
+
     fun onMessagesVisible(visibleIds: List<Int>) {
-        val msgs = _messages.value
         val partnerId = _partnerId.value
-        if (partnerId <= 0) return
-        
+        if (partnerId <= 0 || visibleIds.isEmpty()) return
+
+        // PERF: было O(видимые * все сообщения) через find{} на каждый видимый элемент,
+        // причём вызывалось это почти на каждый кадр скролла. Теперь один проход по списку.
+        val visible = HashSet(visibleIds)
         var maxUnreadId = -1
-        for (id in visibleIds) {
-            val msg = msgs.find { it.id == id }
-            if (msg != null && msg.senderId == partnerId && !msg.isRead) {
-                if (id > maxUnreadId) {
-                    maxUnreadId = id
-                }
+        for (msg in _messages.value) {
+            if (msg.id in visible && msg.senderId == partnerId && !msg.isRead && msg.id > maxUnreadId) {
+                maxUnreadId = msg.id
             }
         }
-        
-        if (maxUnreadId != -1) {
+
+        // Не спамим вебсокет одним и тем же markRead при каждом мелком сдвиге списка.
+        if (maxUnreadId != -1 && maxUnreadId > lastMarkedReadId) {
+            lastMarkedReadId = maxUnreadId
             webSocket?.markRead(myUserId, partnerId, maxUnreadId)
         }
     }
@@ -865,31 +995,31 @@ class ChatScreenViewModel(application: Application) : AndroidViewModel(applicati
         val trimmed = newContent.trim().take(2048)
         val msg = _editingMessage.value
         if (trimmed.isEmpty() || msg == null) return
-        
+
         // Отправляем измененный текст через вебсокет
         webSocket?.editMessage(msg.id, trimmed)
-        
+
         // Локально сразу обновляем
         viewModelScope.launch(Dispatchers.IO) {
             chatDao.updateMessageContent(msg.id, trimmed)
         }
-        
+
         cancelEditing()
     }
 
     fun sendMessage(content: String) {
         val trimmed = content.trim().take(2048)
         if (trimmed.isEmpty()) return
-        
+
         if (_editingMessage.value != null) {
             submitEditMessage(content)
             return
         }
-        
+
         val replyId = _replyingToMessage.value?.id
-        
+
         val replyContent = _replyingToMessage.value?.content
-        val replySenderName = if (replyId != null) (if (_replyingToMessage.value?.senderId == myUserId) "Вы" else partnerName.value) else null
+        val replySenderName = if (replyId != null) (if (_replyingToMessage.value?.senderId == myUserId) com.flasskdev.vibe.ui.theme.VibeStringsHolder.current.you else partnerName.value) else null
         val tempId = -(System.currentTimeMillis() % 1000000000).toInt()
         val tempMsg = com.flasskdev.vibe.data.local.MessageEntity(
             id = tempId,
@@ -905,7 +1035,7 @@ class ChatScreenViewModel(application: Application) : AndroidViewModel(applicati
             chatDao.insertMessage(tempMsg)
             webSocket?.sendMessage(myUserId, _partnerId.value, trimmed, replyId)
         }
-        
+
         cancelReply()
         if (isCurrentlyTyping) {
             isCurrentlyTyping = false
@@ -926,7 +1056,7 @@ class ChatScreenViewModel(application: Application) : AndroidViewModel(applicati
         val replyId = _replyingToMessage.value?.id
         val replyContent = _replyingToMessage.value?.content
         val replySenderName = if (replyId != null) {
-            if (_replyingToMessage.value?.senderId == myUserId) "Вы" else partnerName.value
+            if (_replyingToMessage.value?.senderId == myUserId) com.flasskdev.vibe.ui.theme.VibeStringsHolder.current.you else partnerName.value
         } else null
 
         val tempId = -(System.currentTimeMillis() % 1000000000).toInt()
@@ -960,7 +1090,7 @@ class ChatScreenViewModel(application: Application) : AndroidViewModel(applicati
         val replyId = _replyingToMessage.value?.id
         val replyContent = _replyingToMessage.value?.content
         val replySenderName = if (replyId != null) {
-            if (_replyingToMessage.value?.senderId == myUserId) "Вы" else partnerName.value
+            if (_replyingToMessage.value?.senderId == myUserId) com.flasskdev.vibe.ui.theme.VibeStringsHolder.current.you else partnerName.value
         } else null
 
         val tempId = -(System.currentTimeMillis() % 1000000000).toInt()
@@ -1003,12 +1133,12 @@ class ChatScreenViewModel(application: Application) : AndroidViewModel(applicati
 
     private fun parseTimestamp(ts: String): Long {
         if (ts.isEmpty()) return System.currentTimeMillis()
-        
+
         val tsLong = ts.toLongOrNull()
         if (tsLong != null) {
             return if (tsLong < 10000000000L) tsLong * 1000 else tsLong
         }
-        
+
         try {
             if (ts.contains("T")) {
                 val isoFormat = java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", java.util.Locale.US).apply {
@@ -1037,14 +1167,9 @@ class ChatScreenViewModel(application: Application) : AndroidViewModel(applicati
         partnerUserJob?.cancel()
         typingJob?.cancel()
         typingTimeoutJob?.cancel()
-    }
-
-    companion object {
-        private val timestampFormatter = ThreadLocal.withInitial {
-            java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", java.util.Locale.US).apply {
-                timeZone = java.util.TimeZone.getTimeZone("Europe/Paris")
-            }
-        }
+        initialLoadJob?.cancel()
+        firstPageExpandJob?.cancel()
+        loadMoreWatchdogJob?.cancel()
     }
 
     fun jumpToMessage(messageId: Int, messageList: List<MessageEntity>) {
@@ -1135,11 +1260,11 @@ class ChatScreenViewModel(application: Application) : AndroidViewModel(applicati
 
     fun sendPhotos(context: android.content.Context, uris: List<android.net.Uri>, caption: String = "") {
         if (uris.isEmpty()) return
-        
+
         viewModelScope.launch(kotlinx.coroutines.Dispatchers.IO) {
             val attachments = mutableListOf<String>()
             val imageUris = mutableListOf<android.net.Uri>()
-            
+
             for (uri in uris) {
                 val mimeType = context.contentResolver.getType(uri) ?: ""
                 if (mimeType.startsWith("image/") && !mimeType.contains("gif")) {
@@ -1167,7 +1292,7 @@ class ChatScreenViewModel(application: Application) : AndroidViewModel(applicati
                     try {
                         context.contentResolver.openInputStream(uri)?.use { input ->
                             cachedFile.outputStream().use { output -> input.copyTo(output) }
-                        } ?: throw java.io.IOException("Не удалось открыть выбранный файл")
+                        } ?: throw java.io.IOException(com.flasskdev.vibe.ui.theme.VibeStringsHolder.current.fileOpenFailed)
                         attachments.add(cachedFile.absolutePath)
                     } catch (e: Exception) {
                         cachedFile.delete()
@@ -1175,16 +1300,16 @@ class ChatScreenViewModel(application: Application) : AndroidViewModel(applicati
                     }
                 }
             }
-            
+
             if (imageUris.isNotEmpty()) {
                 val processed = com.flasskdev.vibe.utils.ImageProcessor.processAndCacheImages(context, imageUris)
                 attachments.addAll(processed.map { it.cachedFilePath })
             }
-            
+
             if (attachments.isEmpty()) return@launch
-            
+
             val tempId = -(System.currentTimeMillis() % Int.MAX_VALUE).toInt()
-            
+
             val replyId = _replyingToMessage.value?.id
             val replyContent = _replyingToMessage.value?.content
             val replySenderName = if (_replyingToMessage.value?.senderId == myUserId) null else _partnerName.value
@@ -1203,15 +1328,15 @@ class ChatScreenViewModel(application: Application) : AndroidViewModel(applicati
                 attachments = attachments
             )
             chatDao.insertMessage(tempMsg)
-            
+
             val inputData = androidx.work.Data.Builder()
                 .putInt("messageId", tempId)
                 .build()
-                
+
             val req = androidx.work.OneTimeWorkRequestBuilder<com.flasskdev.vibe.data.network.FileUploadWorker>()
                 .setInputData(inputData)
                 .build()
-                
+
             androidx.work.WorkManager.getInstance(context).enqueue(req)
         }
         cancelReply()
@@ -1221,17 +1346,17 @@ class ChatScreenViewModel(application: Application) : AndroidViewModel(applicati
         viewModelScope.launch(kotlinx.coroutines.Dispatchers.IO) {
             chatDao.updateUploadStatus(messageId, "UPLOADING", null)
             chatDao.updateUploadProgress(messageId, 0)
-            
+
 
 
             val inputData = androidx.work.Data.Builder()
                 .putInt("messageId", messageId)
                 .build()
-                
+
             val req = androidx.work.OneTimeWorkRequestBuilder<com.flasskdev.vibe.data.network.FileUploadWorker>()
                 .setInputData(inputData)
                 .build()
-                
+
             androidx.work.WorkManager.getInstance(context).enqueue(req)
         }
     }
@@ -1240,7 +1365,7 @@ class ChatScreenViewModel(application: Application) : AndroidViewModel(applicati
         viewModelScope.launch(kotlinx.coroutines.Dispatchers.IO) {
             val attachments = listOf(audioFile.absolutePath)
             val tempId = -(System.currentTimeMillis() % Int.MAX_VALUE).toInt()
-            
+
             val replyId = _replyingToMessage.value?.id
             val replyContent = _replyingToMessage.value?.content
             val replySenderName = if (_replyingToMessage.value?.senderId == myUserId) null else _partnerName.value
@@ -1259,20 +1384,73 @@ class ChatScreenViewModel(application: Application) : AndroidViewModel(applicati
                 attachments = attachments
             )
             chatDao.insertMessage(tempMsg)
-            
+
             val inputData = androidx.work.Data.Builder()
                 .putInt("messageId", tempId)
                 .build()
-                
+
             val req = androidx.work.OneTimeWorkRequestBuilder<com.flasskdev.vibe.data.network.FileUploadWorker>()
                 .setInputData(inputData)
                 .build()
-                
+
             androidx.work.WorkManager.getInstance(context).enqueue(req)
         }
         cancelReply()
     }
 
+
+    /**
+     * ПУНКТ 2 — ОТПРАВКА КРУЖКА.
+     *
+     * Отдельный метод понадобился, потому что CircleSendUseCase выдумывал свой
+     * протокол (`videomsg:<url>?d=...&t=...`), которого не знает ни ChatScreen,
+     * ни ChatListScreen, ни MessageUtils — они все разбирают
+     * `video_message:<durationMs>` + файл во вложениях. Из-за расхождения кружок
+     * не отрисовался бы даже при удачной записи.
+     *
+     * Реализация зеркалит sendVoiceMessage: тот же оптимистичный MessageEntity с
+     * отрицательным id и тот же FileUploadWorker, поэтому прогресс загрузки,
+     * ретраи и офлайн-очередь работают из коробки.
+     */
+    fun sendVideoNote(context: android.content.Context, videoFile: java.io.File, durationMs: Long) {
+        viewModelScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+            if (!videoFile.exists() || videoFile.length() == 0L) return@launch
+
+            val attachments = listOf(videoFile.absolutePath)
+            val tempId = -(System.currentTimeMillis() % Int.MAX_VALUE).toInt()
+
+            val replyId = _replyingToMessage.value?.id
+            val replyContent = _replyingToMessage.value?.content
+            val replySenderName =
+                if (_replyingToMessage.value?.senderId == myUserId) null else _partnerName.value
+
+            val tempMsg = com.flasskdev.vibe.data.local.MessageEntity(
+                id = tempId,
+                senderId = myUserId,
+                receiverId = _partnerId.value,
+                content = "video_message:$durationMs",
+                timestamp = System.currentTimeMillis(),
+                replyToId = replyId,
+                replyToContent = replyContent,
+                replyToSenderName = replySenderName,
+                uploadStatus = "UPLOADING",
+                uploadProgress = 0,
+                attachments = attachments
+            )
+            chatDao.insertMessage(tempMsg)
+
+            val inputData = androidx.work.Data.Builder()
+                .putInt("messageId", tempId)
+                .build()
+
+            val req = androidx.work.OneTimeWorkRequestBuilder<com.flasskdev.vibe.data.network.FileUploadWorker>()
+                .setInputData(inputData)
+                .build()
+
+            androidx.work.WorkManager.getInstance(context).enqueue(req)
+        }
+        cancelReply()
+    }
 
     fun jumpToBottom() {
         viewModelScope.launch(Dispatchers.IO) {
@@ -1304,7 +1482,9 @@ class ChatScreenViewModel(application: Application) : AndroidViewModel(applicati
 
         // Message IDs are not a reliable chronological order after migrations or temporary local IDs.
         // Use timestamps from the current window and keep the newest pin first.
-        val visibleMessages = _messages.value.filter { it.id in visibleItemsList }
+        // PERF: `id in List` — линейный поиск для каждого сообщения, на скролле это заметно.
+        val visibleIdSet = HashSet(visibleItemsList)
+        val visibleMessages = _messages.value.filter { it.id in visibleIdSet }
         if (visibleMessages.isEmpty()) return
 
         val visiblePinned = pinned.filter { pin -> visibleMessages.any { it.id == pin.id } }
@@ -1339,7 +1519,7 @@ class ChatScreenViewModel(application: Application) : AndroidViewModel(applicati
             delay(remainingMillis)
             if (_pendingInlineCallbacks.value[pending.messageId] == pending) {
                 completePendingInlineCallback(pending.messageId)
-                botCallbackToast.emit("Бот не ответил за 10 секунд. Кнопки этого сообщения снова доступны.")
+                botCallbackToast.emit(com.flasskdev.vibe.ui.theme.VibeStringsHolder.current.botCallbackTimeout)
             }
         }
     }
@@ -1368,7 +1548,7 @@ class ChatScreenViewModel(application: Application) : AndroidViewModel(applicati
 
         val socket = webSocket
         if (socket == null) {
-            botCallbackToast.tryEmit("Нет соединения с сервером. Попробуйте ещё раз.")
+            botCallbackToast.tryEmit(com.flasskdev.vibe.ui.theme.VibeStringsHolder.current.connectionLostToast)
             return
         }
 

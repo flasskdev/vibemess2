@@ -1,9 +1,13 @@
 package com.flasskdev.vibe
 
+import android.Manifest
+import android.content.pm.PackageManager
 import android.os.Bundle
 import android.util.Log
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.Scaffold
@@ -11,6 +15,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.navigation.compose.rememberNavController
 import com.flasskdev.vibe.data.UserPreferences
+import com.flasskdev.vibe.data.network.GiphyApi
 import com.flasskdev.vibe.data.VibeWebSocket
 import com.flasskdev.vibe.navigation.VibeNavGraph
 import com.flasskdev.vibe.ui.theme.VibeTheme
@@ -35,6 +40,9 @@ import android.os.Build
 import coil.decode.GifDecoder
 import coil.decode.ImageDecoderDecoder
 import coil.decode.VideoFrameDecoder
+import androidx.core.content.ContextCompat
+import com.flasskdev.vibe.utils.NotificationHelper
+import kotlinx.coroutines.delay
 
 class MainActivity : ComponentActivity() {
     private val webSocket = VibeWebSocket()
@@ -47,17 +55,17 @@ class MainActivity : ComponentActivity() {
 
     fun attemptWebSocketConnection() {
         if (!::userPreferences.isInitialized) return
-        
+
         if (!userPreferences.isLoggedIn) {
             webSocket.connect()
             return
         }
-        
+
         if (userPreferences.passcode != null && !isUnlocked) {
             // Do not connect yet, wait for passcode
             return
         }
-        
+
         webSocket.connect()
         FirebaseMessaging.getInstance().token.addOnSuccessListener { token ->
             Log.d("VibeFCM", "FCM Token: $token")
@@ -81,6 +89,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        GiphyApi.init(applicationContext)
 
         val imageLoader = ImageLoader.Builder(this)
             .components {
@@ -118,8 +127,20 @@ class MainActivity : ComponentActivity() {
             .build()
 
         Coil.setImageLoader(imageLoader)
-        
+
         userPreferences = UserPreferences(this)
+
+        // PERF: прогрев процесса. Room, шрифты, assets стикеров, кэш метаданных аудио
+        // и дисковый кэш Coil инициализируются ЛЕНИВО — раньше это происходило ровно в
+        // момент первого входа в переписку и держало main thread секунды (клавиатура не
+        // могла выехать). Второй вход был быстрым просто потому, что всё уже в памяти
+        // процесса, а после перезапуска приложения тормоза возвращались.
+        // Теперь всё это делается в фоне, пока открыт список чатов.
+        com.flasskdev.vibe.utils.AppWarmup.start(this)
+
+        // ПУНКТ 4. Канал создаём ДО запроса разрешения: если разрешение выдадут,
+        // а канала нет, первое же уведомление молча пропадёт.
+        NotificationHelper.createNotificationChannel(this)
 
         setContent {
             var isDarkTheme by remember { mutableStateOf(userPreferences.isDarkTheme) }
@@ -135,6 +156,12 @@ class MainActivity : ComponentActivity() {
                     val hazeState = remember { HazeState() }
                     var showExpandedPlayer by remember { mutableStateOf(false) }
 
+                    // ПУНКТ 4 — ЗАПРОС РАЗРЕШЕНИЯ НА УВЕДОМЛЕНИЯ.
+                    // Раньше его не было нигде: на Android 13+ POST_NOTIFICATIONS
+                    // не выдаётся автоматически, поэтому пуши о сообщениях просто
+                    // не показывались, и понять это по интерфейсу было невозможно.
+                    NotificationPermissionGate(userPreferences = userPreferences)
+
                     androidx.compose.runtime.CompositionLocalProvider(
                         LocalGlobalAudioPlayer provides audioPlayerViewModel
                     ) {
@@ -142,25 +169,32 @@ class MainActivity : ComponentActivity() {
                             modifier = Modifier.fillMaxSize(),
                             containerColor = androidx.compose.material3.MaterialTheme.colorScheme.background
                         ) { _ ->
-                            Box(modifier = Modifier.fillMaxSize().haze(hazeState)) {
+                            // PERF: haze - это ИСТОЧНИК блюра, он заставляет весь NavGraph
+                            // каждый кадр рисоваться в offscreen-слой. Блюр нужен только
+                            // развёрнутому плееру, поэтому слой включается вместе с ним.
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .then(if (showExpandedPlayer) Modifier.haze(hazeState) else Modifier)
+                            ) {
                                 VibeNavGraph(
-                                    navController = navController, 
+                                    navController = navController,
                                     webSocket = webSocket,
                                     userPreferences = userPreferences,
                                     isDarkTheme = isDarkTheme,
-                                    onThemeToggle = { 
-                                        isDarkTheme = !isDarkTheme 
+                                    onThemeToggle = {
+                                        isDarkTheme = !isDarkTheme
                                         userPreferences.isDarkTheme = isDarkTheme
                                     },
                                     language = currentLanguage,
-                                    onLanguageToggle = { 
+                                    onLanguageToggle = {
                                         val newLang = if (currentLanguage == "RU") "EN" else "RU"
                                         currentLanguage = newLang
                                         userPreferences.language = newLang
                                     }
                                 )
                             }
-                            
+
                             if (showExpandedPlayer) {
                                 ExpandedAudioPlayerSheet(
                                     viewModel = audioPlayerViewModel,
@@ -180,3 +214,62 @@ class MainActivity : ComponentActivity() {
         webSocket.disconnect()
     }
 }
+
+
+/**
+ * ============================================================================
+ *  ПУНКТ 4 — «СДЕЛАЙ ЗАПРОС РАЗРЕШЕНИЯ НА УВЕДОМЛЕНИЯ ПРИ ВХОДЕ ПОЛЬЗОВАТЕЛЯ»
+ * ============================================================================
+ *
+ *  Спрашиваем ровно один раз и только после входа: системный диалог
+ *  POST_NOTIFICATIONS можно показать всего дважды за всё время жизни установки,
+ *  дальше Android его молча игнорирует. Поэтому просить его на экране логина,
+ *  до того как человек понял, зачем ему уведомления, — самый быстрый способ
+ *  потерять эту возможность навсегда.
+ *
+ *  Отказ не обрабатывается тостом специально: пользователь только что сам
+ *  нажал «Запретить», напоминать ему об этом сразу же — навязчиво. Ссылка на
+ *  системные настройки уже есть в разделе настроек приложения.
+ */
+@Composable
+private fun NotificationPermissionGate(userPreferences: UserPreferences) {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
+
+    val context = androidx.compose.ui.platform.LocalContext.current
+    val prefs = remember {
+        context.getSharedPreferences("vibe_permission_flags", android.content.Context.MODE_PRIVATE)
+    }
+
+    val launcher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { /* результат не влияет на UI: канал и пуши настроятся при первом сообщении */ }
+
+    LaunchedEffect(Unit) {
+        if (prefs.getBoolean(KEY_NOTIFICATIONS_ASKED, false)) return@LaunchedEffect
+
+        // UserPreferences — обычный SharedPreferences-обёртка, не Compose-state,
+        // поэтому рекомпозиции при логине не будет. Тянуть ради одного флага
+        // StateFlow через весь класс дороже, чем раз в секунду прочитать
+        // булеан: цикл живёт только пока пользователь на экране входа.
+        while (!userPreferences.isLoggedIn) delay(1_000)
+
+        // Пауза, чтобы системный диалог не наложился на анимацию перехода
+        // на главный экран: иначе он выглядит как артефакт и его закрывают
+        // рефлекторно, не читая.
+        delay(700)
+
+        val granted = ContextCompat.checkSelfPermission(
+            context, Manifest.permission.POST_NOTIFICATIONS
+        ) == PackageManager.PERMISSION_GRANTED
+
+        if (granted) {
+            prefs.edit().putBoolean(KEY_NOTIFICATIONS_ASKED, true).apply()
+            return@LaunchedEffect
+        }
+
+        prefs.edit().putBoolean(KEY_NOTIFICATIONS_ASKED, true).apply()
+        launcher.launch(Manifest.permission.POST_NOTIFICATIONS)
+    }
+}
+
+private const val KEY_NOTIFICATIONS_ASKED = "notifications_permission_asked"

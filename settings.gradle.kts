@@ -24,4 +24,4 @@ dependencyResolutionManagement {
 
 rootProject.name = "Vibe"
 include(":app")
- 
+include(":baselineprofile")

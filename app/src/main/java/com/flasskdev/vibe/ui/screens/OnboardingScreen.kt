@@ -4,6 +4,7 @@ import androidx.compose.animation.*
 import androidx.compose.animation.core.*
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
@@ -18,8 +19,11 @@ import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.blur
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
@@ -45,14 +49,64 @@ fun OnboardingScreen(onFinished: () -> Unit) {
             OnboardingPage(pair.first, pair.second, onboardingIcons.getOrElse(index) { "✨" })
         }
     }
-    
+
     val pagerState = rememberPagerState(pageCount = { onboardingPages.size })
     val scope = rememberCoroutineScope()
+    val isLastPage = pagerState.currentPage == onboardingPages.size - 1
+
+    // One shared idle animation drives the hero tile on every page: a slow bob plus a
+    // breathing glow, so a static screen never looks frozen while the user reads.
+    val idle = rememberInfiniteTransition(label = "onboardingIdle")
+    val bob by idle.animateFloat(
+        initialValue = -6f,
+        targetValue = 6f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(2600, easing = FastOutSlowInEasing),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "heroBob"
+    )
+    val glowPulse by idle.animateFloat(
+        initialValue = 0.85f,
+        targetValue = 1.15f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(3200, easing = FastOutSlowInEasing),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "heroGlow"
+    )
 
     Box(modifier = Modifier.fillMaxSize()) {
         VibeBackgroundMesh()
 
         Column(modifier = Modifier.fillMaxSize()) {
+
+            // ─── Skip: available until the last page, then it fades out ───
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .statusBarsPadding()
+                    .padding(horizontal = 20.dp, vertical = 8.dp),
+                contentAlignment = Alignment.CenterEnd
+            ) {
+                this@Column.AnimatedVisibility(
+                    visible = !isLastPage,
+                    enter = fadeIn(tween(200)),
+                    exit = fadeOut(tween(200))
+                ) {
+                    Text(
+                        text = strings.onboardingSkip,
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(percent = 50))
+                            .clickable(onClickLabel = strings.onboardingSkip, onClick = onFinished)
+                            .padding(horizontal = 14.dp, vertical = 8.dp),
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.45f)
+                    )
+                }
+            }
+
             HorizontalPager(
                 state = pagerState,
                 modifier = Modifier
@@ -63,6 +117,7 @@ fun OnboardingScreen(onFinished: () -> Unit) {
             ) { pageIndex ->
                 val page = onboardingPages[pageIndex]
                 val pageOffset = ((pagerState.currentPage - pageIndex) + pagerState.currentPageOffsetFraction)
+                val focus = 1f - pageOffset.absoluteValue.coerceIn(0f, 1f)
 
                 Column(
                     horizontalAlignment = Alignment.CenterHorizontally,
@@ -70,26 +125,29 @@ fun OnboardingScreen(onFinished: () -> Unit) {
                     modifier = Modifier
                         .fillMaxSize()
                         .padding(horizontal = 40.dp)
+                        .semantics {
+                            contentDescription = strings.a11yOnboardingPage(pageIndex + 1, onboardingPages.size)
+                        }
                         .graphicsLayer {
                             translationX = pageOffset * size.width * 0.5f
-                            alpha = 1f - pageOffset.absoluteValue.coerceIn(0f, 1f)
-                            val scale = 0.9f + (1f - pageOffset.absoluteValue.coerceIn(0f, 1f)) * 0.1f
+                            alpha = focus
+                            val scale = 0.9f + focus * 0.1f
                             scaleX = scale
                             scaleY = scale
                         }
                 ) {
                     Box(contentAlignment = Alignment.Center) {
-                        // Soft Radial Glow
+                        // Soft radial glow, breathing with the idle transition
                         Box(
                             modifier = Modifier
                                 .size(300.dp)
                                 .graphicsLayer {
-                                    alpha = (1f - pageOffset.absoluteValue.coerceIn(0f, 1f)) * 0.8f
-                                    scaleX = 1.3f
-                                    scaleY = 1.3f
+                                    alpha = focus * 0.8f
+                                    scaleX = 1.3f * glowPulse
+                                    scaleY = 1.3f * glowPulse
                                 }
                                 .background(
-                                    brush = androidx.compose.ui.graphics.Brush.radialGradient(
+                                    brush = Brush.radialGradient(
                                         colors = listOf(
                                             VibePrimary.copy(alpha = 0.6f),
                                             VibePrimary.copy(alpha = 0.2f),
@@ -101,18 +159,62 @@ fun OnboardingScreen(onFinished: () -> Unit) {
                                 )
                         )
 
+                        // Hero tile: gradient hairline, real elevation, gentle bob
                         Box(
                             modifier = Modifier
+                                .graphicsLayer {
+                                    translationY = bob * focus
+                                    rotationZ = pageOffset * 4f
+                                }
                                 .size(240.dp)
-                                .clip(RoundedCornerShape(64.dp))
-                                .background(MaterialTheme.colorScheme.surface)
-                                .border(1.dp, MaterialTheme.colorScheme.onSurface.copy(alpha = 0.2f), RoundedCornerShape(64.dp)),
+                                .shadow(
+                                    elevation = 26.dp,
+                                    shape = RoundedCornerShape(68.dp),
+                                    ambientColor = VibePrimary.copy(alpha = 0.28f),
+                                    spotColor = VibePrimary.copy(alpha = 0.35f)
+                                )
+                                .clip(RoundedCornerShape(68.dp))
+                                .background(
+                                    Brush.verticalGradient(
+                                        colors = listOf(
+                                            MaterialTheme.colorScheme.surface,
+                                            MaterialTheme.colorScheme.surface.copy(alpha = 0.86f)
+                                        )
+                                    )
+                                )
+                                .border(
+                                    width = 1.dp,
+                                    brush = Brush.verticalGradient(
+                                        colors = listOf(
+                                            Color.White.copy(alpha = 0.35f),
+                                            MaterialTheme.colorScheme.onSurface.copy(alpha = 0.08f)
+                                        )
+                                    ),
+                                    shape = RoundedCornerShape(68.dp)
+                                ),
                             contentAlignment = Alignment.Center
                         ) {
+                            // Specular sheen across the top half of the tile
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .fillMaxHeight(0.5f)
+                                    .align(Alignment.TopCenter)
+                                    .background(
+                                        Brush.verticalGradient(
+                                            colors = listOf(
+                                                Color.White.copy(alpha = 0.10f),
+                                                Color.Transparent
+                                            )
+                                        )
+                                    )
+                            )
+
                             Text(
                                 text = page.icon,
                                 fontSize = 100.sp,
                                 modifier = Modifier.graphicsLayer {
+                                    // Parallax: the glyph trails behind its tile while swiping
                                     translationX = -pageOffset * 150f
                                     rotationZ = pageOffset * 10f
                                 }
@@ -120,27 +222,29 @@ fun OnboardingScreen(onFinished: () -> Unit) {
                         }
                     }
 
-                    Spacer(modifier = Modifier.height(64.dp))
+                    Spacer(modifier = Modifier.height(56.dp))
 
                     Text(
                         text = page.title,
                         style = MaterialTheme.typography.displayLarge,
                         color = MaterialTheme.colorScheme.onBackground,
-                        textAlign = TextAlign.Center
+                        textAlign = TextAlign.Center,
+                        modifier = Modifier.graphicsLayer { translationX = -pageOffset * 60f }
                     )
 
-                    Spacer(modifier = Modifier.height(20.dp))
+                    Spacer(modifier = Modifier.height(18.dp))
 
                     Text(
                         text = page.description,
                         style = MaterialTheme.typography.bodyLarge,
                         color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.45f),
-                        textAlign = TextAlign.Center
+                        textAlign = TextAlign.Center,
+                        modifier = Modifier.graphicsLayer { translationX = -pageOffset * 30f }
                     )
                 }
             }
 
-            // Liquid Page Control
+            // ─── Liquid page control ───
             Row(
                 modifier = Modifier
                     .height(64.dp)
@@ -150,17 +254,13 @@ fun OnboardingScreen(onFinished: () -> Unit) {
             ) {
                 repeat(onboardingPages.size) { index ->
                     val offset = (pagerState.currentPage - index + pagerState.currentPageOffsetFraction).absoluteValue
-                    
-                    val width = if (offset < 1f) {
-                        8.dp + (24.dp * (1f - offset))
+                    val focus = (1f - offset).coerceIn(0f, 1f)
+
+                    val width = 8.dp + (26.dp * focus)
+                    val color = if (focus > 0f) {
+                        MaterialTheme.colorScheme.primary.copy(alpha = 0.28f + (0.72f * focus))
                     } else {
-                        8.dp
-                    }
-                    
-                    val color = if (offset < 1f) {
-                        MaterialTheme.colorScheme.primary.copy(alpha = 0.3f + (0.7f * (1f - offset)))
-                    } else {
-                        MaterialTheme.colorScheme.onBackground.copy(alpha = 0.1f)
+                        MaterialTheme.colorScheme.onBackground.copy(alpha = 0.10f)
                     }
 
                     Box(
@@ -169,14 +269,33 @@ fun OnboardingScreen(onFinished: () -> Unit) {
                             .width(width)
                             .height(8.dp)
                             .clip(CircleShape)
-                            .background(color)
+                            .background(
+                                if (focus > 0.5f) {
+                                    Brush.horizontalGradient(
+                                        colors = listOf(
+                                            MaterialTheme.colorScheme.primary,
+                                            Color(0xFF5AC8FA)
+                                        )
+                                    )
+                                } else {
+                                    Brush.horizontalGradient(colors = listOf(color, color))
+                                }
+                            )
+                            .clickable(onClickLabel = strings.a11yOnboardingPage(index + 1, onboardingPages.size)) {
+                                scope.launch {
+                                    pagerState.animateScrollToPage(
+                                        page = index,
+                                        animationSpec = spring(stiffness = Spring.StiffnessLow)
+                                    )
+                                }
+                            }
                     )
                 }
             }
 
             Box(modifier = Modifier.padding(horizontal = 32.dp, vertical = 40.dp)) {
                 VibeButton(
-                    text = if (pagerState.currentPage == onboardingPages.size - 1) "GET STARTED" else "CONTINUE",
+                    text = if (isLastPage) strings.onboardingGetStarted else strings.continueBtn,
                     onClick = {
                         if (pagerState.currentPage < onboardingPages.size - 1) {
                             scope.launch {

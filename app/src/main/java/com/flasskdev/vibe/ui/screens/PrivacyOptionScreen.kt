@@ -17,6 +17,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.flasskdev.vibe.ui.theme.VibeTopGlow
 
 enum class PrivacyType {
     EVERYONE, NOBODY, SELECTED
@@ -37,15 +38,21 @@ fun PrivacyOptionScreen(
     val scrollState = rememberScrollState()
     var localValue by remember(savedValue, initialValue) { mutableStateOf(initialValue) }
 
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(top = 48.dp, bottom = 80.dp)
+    Box(
+        modifier = Modifier.fillMaxSize()
     ) {
+        VibeTopGlow(height = 380.dp)
+
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .statusBarsPadding()
+                .padding(top = 8.dp)
+        ) {
         // Header
         Row(
             verticalAlignment = Alignment.CenterVertically,
-            modifier = Modifier.padding(start = 16.dp, bottom = 16.dp)
+            modifier = Modifier.padding(start = 16.dp, bottom = 12.dp)
         ) {
             IconButton(onClick = onBack) {
                 Icon(
@@ -81,6 +88,8 @@ fun PrivacyOptionScreen(
                 .fillMaxSize()
                 .padding(horizontal = 16.dp)
                 .verticalScroll(scrollState)
+                .navigationBarsPadding()
+                .padding(bottom = 24.dp)
         ) {
             // Options section
             SettingsSection {
@@ -180,6 +189,7 @@ fun PrivacyOptionScreen(
             Spacer(modifier = Modifier.height(32.dp))
         }
     }
+}
 }
 
 @Composable

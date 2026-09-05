@@ -30,6 +30,8 @@ class UserPreferences(context: Context) {
         private const val KEY_LANGUAGE = "language"
         private const val KEY_IS_DARK_THEME = "is_dark_theme"
         private const val KEY_PASSCODE = "passcode"
+        private const val KEY_TWO_FACTOR_PASSWORD = "two_factor_password"
+        private const val KEY_TWO_FACTOR_HINT = "two_factor_hint"
         private const val KEY_DEVICE_ID = "device_id"
 
         private const val KEY_PRIVACY_ACTIVITY = "privacy_activity"
@@ -147,6 +149,14 @@ class UserPreferences(context: Context) {
     var passcode: String?
         get() = prefs.getString(KEY_PASSCODE, null)
         set(value) = prefs.edit().putString(KEY_PASSCODE, value).apply()
+
+    var twoFactorPassword: String?
+        get() = prefs.getString(KEY_TWO_FACTOR_PASSWORD, null)
+        set(value) = prefs.edit().putString(KEY_TWO_FACTOR_PASSWORD, value).apply()
+
+    var twoFactorHint: String?
+        get() = prefs.getString(KEY_TWO_FACTOR_HINT, null)
+        set(value) = prefs.edit().putString(KEY_TWO_FACTOR_HINT, value).apply()
 
     var userId: Int
         get() = prefs.getInt(KEY_USER_ID, 0)

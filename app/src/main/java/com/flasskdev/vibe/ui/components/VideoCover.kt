@@ -20,6 +20,8 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -61,7 +63,9 @@ fun VideoCover(
     val context = LocalContext.current
     val key = remember(source) { VideoCoverGenerator.stableKey(source) }
 
-    var localCover by remember(key) { mutableStateOf(VideoCoverGenerator.cached(context, key)) }
+    // PERF: VideoCoverGenerator.cached() читает диск, а вызывался он внутри remember,
+    // то есть прямо в композиции на UI-потоке для КАЖДОЙ видео-плитки в чате.
+    var localCover by remember(key) { mutableStateOf<Any?>(null) }
     var attempt by remember(key) { mutableStateOf(0) }
     var loaded by remember(key) { mutableStateOf(false) }
 
@@ -80,13 +84,19 @@ fun VideoCover(
 
     // Фоновая генерация обложки — страховка на случай, когда ни серверная
     // обложка, ни Coil-декодер не сработали.
-    LaunchedEffect(key, localCover == null) {
-        if (localCover == null) {
-            VideoCoverGenerator.createAsync(context, source)?.let { generated ->
-                localCover = generated
-                attempt = 0
-                loaded = false
-            }
+    LaunchedEffect(key) {
+        // Сначала дешёвая проверка кэша на диске, потом (и только при промахе) генерация.
+        val cached = withContext(Dispatchers.IO) { VideoCoverGenerator.cached(context, key) }
+        if (cached != null) {
+            localCover = cached
+            attempt = 0
+            loaded = false
+            return@LaunchedEffect
+        }
+        VideoCoverGenerator.createAsync(context, source)?.let { generated ->
+            localCover = generated
+            attempt = 0
+            loaded = false
         }
     }
 

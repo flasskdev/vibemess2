@@ -17,14 +17,27 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.flasskdev.vibe.ui.theme.LocalVibeStrings
+import com.flasskdev.vibe.ui.theme.VibeStrings
+import com.flasskdev.vibe.ui.theme.VibeTopGlow
 
-fun formatBlockedCount(count: Int): String {
+fun formatBlockedCount(count: Int, strings: VibeStrings): String {
+    val locale = java.util.Locale.getDefault()
     return when {
         count <= 0 -> "0"
         count < 1000 -> count.toString()
-        count < 10_000 -> String.format(java.util.Locale.getDefault(), "%.1f тыс.", count / 1000.0).replace(".0", "")
-        count < 1_000_000 -> String.format(java.util.Locale.getDefault(), "%d тыс.", count / 1000)
-        else -> String.format(java.util.Locale.getDefault(), "%.1f млн", count / 1_000_000.0).replace(".0", "")
+        count < 10_000 -> strings.unitCompactFormat(
+            String.format(locale, "%.1f", count / 1000.0).replace(".0", "").replace(",0", ""),
+            strings.unitThousandShort
+        )
+        count < 1_000_000 -> strings.unitCompactFormat(
+            String.format(locale, "%d", count / 1000),
+            strings.unitThousandShort
+        )
+        else -> strings.unitCompactFormat(
+            String.format(locale, "%.1f", count / 1_000_000.0).replace(".0", "").replace(",0", ""),
+            strings.unitMillionShort
+        )
     }
 }
 
@@ -32,7 +45,10 @@ fun formatBlockedCount(count: Int): String {
 fun PrivacySettingsContent(
     onBack: () -> Unit,
     blockedCount: Int = 0,
+    twoFactorEnabled: Boolean = false,
+    passcodeEnabled: Boolean = false,
     onNavigateToBlockedUsers: () -> Unit,
+    onNavigateToTwoFactor: () -> Unit = {},
     onNavigateToPasscodeSetup: () -> Unit,
     onNavigateToActivity: () -> Unit,
     onNavigateToAvatar: () -> Unit,
@@ -40,27 +56,34 @@ fun PrivacySettingsContent(
     onNavigateToMessages: () -> Unit,
     onNavigateToStatus: () -> Unit
 ) {
+    val strings = LocalVibeStrings.current
     val scrollState = rememberScrollState()
 
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(top = 48.dp, bottom = 80.dp)
+    Box(
+        modifier = Modifier.fillMaxSize()
     ) {
+        VibeTopGlow(height = 380.dp)
+
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .statusBarsPadding()
+                .padding(top = 8.dp)
+        ) {
         Row(
             verticalAlignment = Alignment.CenterVertically,
-            modifier = Modifier.padding(start = 16.dp, bottom = 16.dp)
+            modifier = Modifier.padding(start = 16.dp, bottom = 12.dp)
         ) {
             IconButton(onClick = onBack) {
                 Icon(
                     imageVector = Icons.AutoMirrored.Rounded.ArrowBack,
-                    contentDescription = "Назад",
+                    contentDescription = strings.backBtn,
                     tint = MaterialTheme.colorScheme.onBackground
                 )
             }
             Spacer(modifier = Modifier.width(8.dp))
             Text(
-                text = "Конфиденциальность",
+                text = strings.privacyScreenTitle,
                 color = MaterialTheme.colorScheme.onBackground,
                 fontSize = 26.sp,
                 fontWeight = FontWeight.Black,
@@ -72,61 +95,71 @@ fun PrivacySettingsContent(
                 .fillMaxSize()
                 .padding(horizontal = 16.dp)
                 .verticalScroll(scrollState)
+                .navigationBarsPadding()
+                .padding(bottom = 24.dp)
         ) {
             // Group 1
             SettingsSection {
                 SettingsItem(
                     icon = Icons.Rounded.Security,
-                    text = "Двойная аутентификация",
+                    text = strings.privacyTwoFactor,
                     iconTint = Color(0xFF2196F3),
-                    onClick = { /* TODO */ }
+                    value = if (twoFactorEnabled) strings.twoFactorStatusEnabled else strings.twoFactorStatusDisabled,
+                    onClick = onNavigateToTwoFactor
                 )
+                SettingsDivider()
                 SettingsItem(
                     icon = Icons.Rounded.Password,
-                    text = "Вход по коду",
+                    text = strings.privacyPasscodeLogin,
                     iconTint = Color(0xFF4CAF50),
+                    value = if (passcodeEnabled) strings.twoFactorStatusEnabled else strings.twoFactorStatusDisabled,
                     onClick = onNavigateToPasscodeSetup
                 )
+                SettingsDivider()
                 SettingsItem(
                     icon = Icons.Rounded.Block,
-                    text = "Заблокированные",
+                    text = strings.privacyBlocked,
                     iconTint = Color(0xFFF44336),
-                    value = formatBlockedCount(blockedCount),
+                    value = formatBlockedCount(blockedCount, strings),
                     onClick = onNavigateToBlockedUsers
                 )
             }
 
-            Spacer(modifier = Modifier.height(24.dp))
+            Spacer(modifier = Modifier.height(36.dp))
 
             // Group 2
             SettingsSection {
                 SettingsItem(
                     icon = Icons.Rounded.AccessTime,
-                    text = "Статус активности",
+                    text = strings.privacyActivityTitle,
                     iconTint = Color(0xFF9C27B0),
                     onClick = onNavigateToActivity
                 )
+                SettingsDivider()
                 SettingsItem(
                     icon = Icons.Rounded.AccountBox,
-                    text = "Аватарка",
+                    text = strings.privacyAvatarTitle,
                     iconTint = Color(0xFFE91E63),
                     onClick = onNavigateToAvatar
                 )
+                SettingsDivider()
                 SettingsItem(
                     icon = Icons.Rounded.Forward,
-                    text = "Пересланные сообщения",
+                    text = strings.privacyForwardedTitle,
                     iconTint = Color(0xFF00BCD4),
                     onClick = onNavigateToForwarded
                 )
+                SettingsDivider()
                 SettingsItem(
                     icon = Icons.Rounded.Chat,
-                    text = "Сообщения",
+                    text = strings.privacyMessagesTitle,
                     iconTint = Color(0xFF4CAF50),
                     onClick = onNavigateToMessages
                 )
+                SettingsDivider()
                 SettingsItem(
                     icon = Icons.Rounded.Info,
-                    text = "Статус",
+                    text = strings.privacyStatusTitle,
                     iconTint = Color(0xFFFFC107),
                     onClick = onNavigateToStatus
                 )
@@ -135,4 +168,5 @@ fun PrivacySettingsContent(
             Spacer(modifier = Modifier.height(16.dp))
         }
     }
+}
 }

@@ -1,12 +1,18 @@
 package com.flasskdev.vibe.data.network
 
+import android.content.Context
 import com.flasskdev.vibe.BuildConfig
+
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import okhttp3.Cache
 import okhttp3.OkHttpClient
+
 import okhttp3.Request
 import org.json.JSONObject
+import java.io.File
 import java.net.URLEncoder
+
 import java.util.concurrent.TimeUnit
 
 /**
@@ -35,10 +41,45 @@ object GiphyApi {
 
     private const val BASE = "https://api.giphy.com/v1/gifs"
 
-    private val client = OkHttpClient.Builder()
-        .connectTimeout(15, TimeUnit.SECONDS)
-        .readTimeout(15, TimeUnit.SECONDS)
-        .build()
+    @Volatile
+    private var client: OkHttpClient = createClient()
+    private var isHttpCacheInitialized = false
+
+    /**
+     * Initializes the shared HTTP response cache once at application startup.
+     * GifCache still owns parsed-result TTL caching; this cache avoids repeat
+     * downloads when that higher-level cache is cold or has expired.
+     */
+    fun init(context: Context) {
+        synchronized(this) {
+            if (isHttpCacheInitialized) return
+            client = createClient(
+                cache = Cache(File(context.applicationContext.cacheDir, "giphy_http"), HTTP_CACHE_SIZE_BYTES)
+            )
+            isHttpCacheInitialized = true
+        }
+    }
+
+    private fun createClient(cache: Cache? = null): OkHttpClient =
+        OkHttpClient.Builder()
+            .connectTimeout(15, TimeUnit.SECONDS)
+            .readTimeout(15, TimeUnit.SECONDS)
+            .apply {
+                if (cache != null) {
+                    cache(cache)
+                    addNetworkInterceptor { chain ->
+                        chain.proceed(chain.request())
+                            .newBuilder()
+                            // GIPHY marks responses as no-cache; the picker can safely reuse a list for 10 minutes.
+                            .header("Cache-Control", "public, max-age=600")
+                            .removeHeader("Pragma")
+                            .build()
+                    }
+                }
+            }
+            .build()
+
+    private const val HTTP_CACHE_SIZE_BYTES = 8L * 1024 * 1024
 
     private val apiKey: String get() = BuildConfig.GIPHY_API_KEY
 

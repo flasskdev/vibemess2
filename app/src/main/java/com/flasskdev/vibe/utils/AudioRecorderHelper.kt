@@ -16,10 +16,10 @@ import java.io.IOException
 class AudioRecorderHelper(private val context: Context) {
     private var mediaRecorder: MediaRecorder? = null
     private var outputFile: File? = null
-    
+
     private val _isRecording = MutableStateFlow(false)
     val isRecording: StateFlow<Boolean> = _isRecording
-    
+
     private val _recordingDuration = MutableStateFlow(0L) // In milliseconds
     val recordingDuration: StateFlow<Long> = _recordingDuration
 
@@ -29,7 +29,7 @@ class AudioRecorderHelper(private val context: Context) {
     fun startRecording(): File? {
         try {
             outputFile = File(context.cacheDir, "voice_msg_${System.currentTimeMillis()}.m4a")
-            
+
             mediaRecorder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
                 MediaRecorder(context)
             } else {

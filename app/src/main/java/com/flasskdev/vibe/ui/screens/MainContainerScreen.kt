@@ -97,11 +97,30 @@ import androidx.compose.foundation.combinedClickable
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.style.TextOverflow
+import com.flasskdev.vibe.ui.theme.luminanceIsDark
+import com.flasskdev.vibe.ui.theme.VibeTopGlow
+import com.flasskdev.vibe.ui.theme.VibeStrings
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.material.icons.filled.ContentCopy
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.graphics.drawscope.Stroke
 
-enum class MainTab(val label: String) {
-    CHATS("Чаты"),
-    SETTINGS("Настройки"),
-    PROFILE("Профиль")
+/**
+ * Tab labels are no longer baked into the enum: they are resolved from the active
+ * string table at composition time, so switching the language re-labels the bar
+ * instantly instead of keeping whatever locale was loaded when the enum class was
+ * first initialised.
+ */
+enum class MainTab {
+    CHATS,
+    SETTINGS,
+    PROFILE;
+
+    fun label(strings: VibeStrings): String = when (this) {
+        CHATS -> strings.tabChats
+        SETTINGS -> strings.tabSettings
+        PROFILE -> strings.tabProfile
+    }
 }
 
 @Composable
@@ -118,12 +137,31 @@ fun MainContainerScreen(
     onProfileClick: ((userId: Int, username: String) -> Unit)? = null
 ) {
     var selectedTab by androidx.compose.runtime.saveable.rememberSaveable { mutableStateOf(MainTab.CHATS) }
+    var settingsScreen by androidx.compose.runtime.saveable.rememberSaveable { mutableStateOf("main") }
     var showLogoutToast by remember { mutableStateOf(false) }
     var logoutToastMessage by remember { mutableStateOf("") }
-    
+
     val chatViewModel: ChatViewModel = viewModel()
     val chats by chatViewModel.chats.collectAsState()
     val totalUnreadCount = chats.filter { !it.chat.isMuted }.sumOf { it.chat.unreadCount }
+    val isBottomBarVisible = selectedTab != MainTab.SETTINGS || settingsScreen == "main"
+    // Пункт 7: контекстное меню просит убрать таббар, пока оно открыто.
+    var isTabBarSuppressed by remember { mutableStateOf(false) }
+
+    // Каждая вкладка refract-ит ТОЛЬКО себя (иначе поле поиска в чатах ловило
+    // строку "Аккаунт" из вкладки настроек), но таббару нужен слой АКТИВНОЙ
+    // вкладки, чтобы сквозь стекло было видно контент. Поэтому состояния
+    // живут здесь, а не внутри лямбды AnimatedContent.
+    val chatsLiquid = rememberLiquidState()
+    val settingsLiquid = rememberLiquidState()
+    val profileLiquid = rememberLiquidState()
+    val liquidStateFor: (MainTab) -> LiquidState = { t ->
+        when (t) {
+            MainTab.CHATS -> chatsLiquid
+            MainTab.SETTINGS -> settingsLiquid
+            MainTab.PROFILE -> profileLiquid
+        }
+    }
 
     val scope = rememberCoroutineScope()
     val context = androidx.compose.ui.platform.LocalContext.current
@@ -165,7 +203,7 @@ fun MainContainerScreen(
                     // media-heavy tab trees alive in offscreen alpha layers, which is what made
                     // the switch feel janky.
                     fadeIn(animationSpec = tween(130)) togetherWith
-                        fadeOut(animationSpec = tween(130))
+                            fadeOut(animationSpec = tween(130))
                 },
                 label = "tabTransition"
             ) { tab ->
@@ -174,7 +212,7 @@ fun MainContainerScreen(
                 // the Chats search field therefore sampled a snapshot that could still contain
                 // the Settings tab, painting its "Аккаунт" row inside the search pill.
                 // Each tab now owns its own layer, so a tab can only ever refract itself.
-                val tabLiquidState = rememberLiquidState()
+                val tabLiquidState = liquidStateFor(tab)
 
                 Box(
                     modifier = Modifier
@@ -186,7 +224,8 @@ fun MainContainerScreen(
                             liquidState = tabLiquidState,
                             webSocket = webSocket,
                             onChatClick = onOpenChat,
-                            viewModel = chatViewModel
+                            viewModel = chatViewModel,
+                            onTabBarSuppressedChange = { isTabBarSuppressed = it }
                         )
                         MainTab.SETTINGS -> SettingsScreen(
                             liquidState = tabLiquidState,
@@ -194,7 +233,9 @@ fun MainContainerScreen(
                             webSocket = webSocket,
                             onLogout = onLogout,
                             onNavigateToPasscodeSetup = onNavigateToPasscodeSetup,
-                            onProfileClick = onProfileClick
+                            onProfileClick = onProfileClick,
+                            currentScreen = settingsScreen,
+                            onCurrentScreenChange = { settingsScreen = it }
                         )
                         MainTab.PROFILE -> ProfileScreen(
                             liquidState = tabLiquidState,
@@ -213,219 +254,42 @@ fun MainContainerScreen(
 
 
 
-        // НАВИГАЦИОННАЯ ПАНЕЛЬ
+        // ─── NAVIGATION BAR — Liquid Glass v2, реализация в VibeTabBar.kt ───
+        // 330 строк разметки уехали в отдельный файл: здесь оставлено только
+        // управление видимостью, чтобы MainContainerScreen читался за один экран.
         Box(
-            modifier = Modifier
-                .fillMaxSize(),
+            modifier = Modifier.fillMaxSize(),
             contentAlignment = Alignment.BottomCenter
         ) {
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .navigationBarsPadding()
-                    .padding(16.dp)
-                    .clip(androidx.compose.foundation.shape.RoundedCornerShape(34.dp))
-                    // The navigation shell must never share the screen LiquidState: otherwise
-                    // refraction snapshots from a tab can remain over its labels after navigation.
-                    .background(androidx.compose.material3.MaterialTheme.colorScheme.surface.copy(alpha = 0.92f))
-                    .border(
-                        width = 1.dp,
-                        color = androidx.compose.material3.MaterialTheme.colorScheme.onSurface.copy(alpha = 0.08f),
-                        shape = androidx.compose.foundation.shape.RoundedCornerShape(34.dp)
+            AnimatedVisibility(
+                // isTabBarSuppressed — это пункт 7: при вызове контекстного меню
+                // в списке чатов таббар должен уехать, а не оставаться под скримом.
+                visible = isBottomBarVisible && !isTabBarSuppressed,
+                enter = slideInVertically(
+                    initialOffsetY = { it },
+                    animationSpec = spring(
+                        dampingRatio = 0.82f,
+                        stiffness = Spring.StiffnessMediumLow
                     )
+                ) + fadeIn(animationSpec = tween(200)),
+                exit = slideOutVertically(
+                    targetOffsetY = { it },
+                    animationSpec = spring(
+                        dampingRatio = 0.90f,
+                        stiffness = Spring.StiffnessMediumLow
+                    )
+                ) + fadeOut(animationSpec = tween(120))
             ) {
-                BoxWithConstraints(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(60.dp)
-                ) {
-                    val tabWidth = maxWidth / MainTab.entries.size
-                    
-                    // The LEADER reaches the target quickly; the TAIL lags behind with a softer,
-                    // lower-stiffness spring. Because we draw a single blob that spans from the
-                    // tail to the leader, the indicator visually STRETCHES like a liquid droplet
-                    // between the old and new tab, then collapses back into a pill as the tail
-                    // catches up.
-                    val leaderIndex by animateFloatAsState(
-                        targetValue = selectedTab.ordinal.toFloat(),
-                        animationSpec = spring(
-                            dampingRatio = 0.72f,
-                            stiffness = Spring.StiffnessMedium
-                        ),
-                        label = "selectorLeader"
-                    )
-                    val tailIndex by animateFloatAsState(
-                        targetValue = selectedTab.ordinal.toFloat(),
-                        animationSpec = spring(
-                            dampingRatio = 0.9f,
-                            stiffness = Spring.StiffnessLow
-                        ),
-                        label = "selectorTail"
-                    )
-
-                    val leaderOffsetX = tabWidth * leaderIndex
-                    val tailOffsetX = tabWidth * tailIndex
-
-                    // The blob covers everything between the tail and the leader position.
-                    val startX = if (leaderOffsetX < tailOffsetX) leaderOffsetX else tailOffsetX
-                    val endX = (if (leaderOffsetX > tailOffsetX) leaderOffsetX else tailOffsetX) + tabWidth
-                    val blobWidth = endX - startX
-                    // 0f at rest, grows while the droplet is stretched mid-transition.
-                    val elongation = ((blobWidth.value - tabWidth.value) / tabWidth.value).coerceIn(0f, 1f)
-
-                    // VERTICAL deformation: a squash-and-stretch pulse fired on every tab change.
-                    // Negative = flattened while the droplet is in flight, positive = it overshoots
-                    // taller as it lands, then settles.
-                    val verticalDeform = remember { Animatable(0f) }
-                    LaunchedEffect(selectedTab) {
-                        verticalDeform.snapTo(0f)
-                        verticalDeform.animateTo(
-                            targetValue = 0f,
-                            animationSpec = keyframes {
-                                durationMillis = 620
-                                0f at 0 using FastOutSlowInEasing
-                                -1f at 150 using FastOutSlowInEasing   // flattened in flight
-                                0.6f at 360 using FastOutSlowInEasing  // overshoots tall on landing
-                                -0.18f at 500 using FastOutSlowInEasing // small counter-bounce
-                                0f at 620
-                            }
-                        )
-                    }
-
-                    val deform = verticalDeform.value
-
-                    Box(
-                        modifier = Modifier
-                            .offset(x = startX)
-                            .width(blobWidth)
-                            .fillMaxHeight()
-                            .padding(horizontal = 12.dp, vertical = 10.dp)
-                            .graphicsLayer {
-                                // Horizontal droplet stretch (from the tail lag) combined with the
-                                // vertical squash-stretch pulse. Volume is preserved: whatever it
-                                // gains on one axis it loses on the other.
-                                scaleX = (1f + elongation * 0.06f) * (1f - deform * 0.10f)
-                                scaleY = (1f - elongation * 0.26f) * (1f + deform * 0.22f)
-                            }
-                    ) {
-                         // LIQUID GLASS: a tinted translucent body + a specular sheen on the upper
-                         // half + a gradient rim that is bright on top and dim at the bottom.
-                         Box(
-                             modifier = Modifier
-                                 .matchParentSize()
-                                 // A full capsule (percent = 50) reads as a droplet when stretched.
-                                 .clip(androidx.compose.foundation.shape.RoundedCornerShape(percent = 50))
-                                 .background(
-                                     Brush.linearGradient(
-                                         colors = listOf(
-                                             androidx.compose.material3.MaterialTheme.colorScheme.primary.copy(alpha = 0.30f),
-                                             androidx.compose.material3.MaterialTheme.colorScheme.primary.copy(alpha = 0.16f),
-                                             androidx.compose.material3.MaterialTheme.colorScheme.secondary.copy(alpha = 0.20f)
-                                         )
-                                     )
-                                 )
-                                 .border(
-                                     width = 1.dp,
-                                     brush = Brush.verticalGradient(
-                                         colors = listOf(
-                                             Color.White.copy(alpha = 0.42f),
-                                             androidx.compose.material3.MaterialTheme.colorScheme.primary.copy(alpha = 0.28f),
-                                             Color.White.copy(alpha = 0.10f)
-                                         )
-                                     ),
-                                     shape = androidx.compose.foundation.shape.RoundedCornerShape(percent = 50)
-                                 )
-                         ) {
-                             // Specular highlight: the "glass" catching light along its top edge.
-                             Box(
-                                 modifier = Modifier
-                                     .fillMaxWidth()
-                                     .fillMaxHeight(0.55f)
-                                     .background(
-                                         Brush.verticalGradient(
-                                             colors = listOf(
-                                                 Color.White.copy(alpha = 0.20f),
-                                                 Color.White.copy(alpha = 0.05f),
-                                                 Color.Transparent
-                                             )
-                                         )
-                                     )
-                             )
-                         }
-                    }
-
-                    Row(
-                        modifier = Modifier.fillMaxSize(),
-                        horizontalArrangement = Arrangement.SpaceEvenly,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        MainTab.entries.forEach { tab ->
-                            val isSelected = selectedTab == tab
-                            
-                            Box(
-                                modifier = Modifier
-                                    .weight(1f)
-                                    .fillMaxHeight()
-                                    .clickable(
-                                        interactionSource = remember { MutableInteractionSource() },
-                                        indication = null
-                                    ) {
-                                        if (selectedTab != tab) selectedTab = tab
-                                    },
-                                contentAlignment = Alignment.Center
-                            ) {
-                                Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
-                                    Icon(
-                                        imageVector = when (tab) {
-                                            MainTab.CHATS -> if (isSelected) Icons.Filled.Forum else Icons.Outlined.Forum
-                                            MainTab.SETTINGS -> if (isSelected) Icons.Filled.Settings else Icons.Outlined.Settings
-                                            MainTab.PROFILE -> if (isSelected) Icons.Filled.Person else Icons.Outlined.PersonOutline
-                                        },
-                                        contentDescription = null,
-                                        modifier = Modifier.size(24.dp),
-                                        tint = if (isSelected) androidx.compose.material3.MaterialTheme.colorScheme.primary else androidx.compose.material3.MaterialTheme.colorScheme.onBackground.copy(alpha = 0.4f)
-                                    )
-                                    Spacer(modifier = Modifier.height(1.dp))
-                                    Text(
-                                        text = tab.label,
-                                        style = androidx.compose.material3.MaterialTheme.typography.labelSmall,
-                                        color = if (isSelected) androidx.compose.material3.MaterialTheme.colorScheme.primary else androidx.compose.material3.MaterialTheme.colorScheme.onBackground.copy(alpha = 0.4f)
-                                    )
-                                }
-
-                                // Unclipped Badge in the top right corner
-                                if (tab == MainTab.CHATS && totalUnreadCount > 0) {
-                                    val formattedCount = when {
-                                        totalUnreadCount >= 1_000_000 -> String.format(Locale.US, "%.1fm", totalUnreadCount / 1_000_000.0).replace(".0", "")
-                                        totalUnreadCount >= 1_000 -> String.format(Locale.US, "%.1fk", totalUnreadCount / 1_000.0).replace(".0", "")
-                                        else -> totalUnreadCount.toString()
-                                    }
-                                    
-                                    Box(
-                                        modifier = Modifier
-                                            .align(Alignment.Center)
-                                            .offset(x = 12.dp, y = (-12).dp)
-                                            .background(androidx.compose.material3.MaterialTheme.colorScheme.error, CircleShape)
-                                            .border(1.5.dp, androidx.compose.material3.MaterialTheme.colorScheme.surface, CircleShape)
-                                            .padding(horizontal = 4.dp, vertical = 2.dp)
-                                            .defaultMinSize(minWidth = 16.dp),
-                                        contentAlignment = Alignment.Center
-                                    ) {
-                                        Text(
-                                            text = formattedCount,
-                                            color = Color.White,
-                                            fontSize = 9.sp,
-                                            fontWeight = FontWeight.Bold
-                                        )
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+                VibeTabBar(
+                    selectedTab = selectedTab,
+                    onTabSelected = { selectedTab = it },
+                    unreadCount = totalUnreadCount,
+                    strings = strings,
+                    liquidState = liquidStateFor(selectedTab)
+                )
             }
         }
-        
+
         Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.BottomCenter) {
             com.flasskdev.vibe.ui.components.VibeToast(
                 message = logoutToastMessage,
@@ -484,220 +348,447 @@ fun ProfileScreen(
         }
     }
 
-    Box(modifier = Modifier.fillMaxSize()) {
+    val primary = MaterialTheme.colorScheme.primary
+    val isDark = MaterialTheme.colorScheme.background.luminanceIsDark()
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(MaterialTheme.colorScheme.background)
+    ) {
+
+        // ─── Ambient aurora wash behind the hero card ───
+        VibeTopGlow(height = 430.dp)
+
         Column(
             modifier = Modifier
                 .fillMaxSize()
                 .statusBarsPadding()
-                .padding(top = 16.dp, bottom = 80.dp) // space for bottom nav
+                .padding(top = 12.dp)
         ) {
-            // Top Bar - Pinned at the top
+            // ─── TOP BAR — pinned at the top ───
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(horizontal = 24.dp)
-                    .padding(bottom = 24.dp),
+                    .padding(horizontal = 20.dp)
+                    .padding(bottom = 12.dp),
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Text(
                     text = strings.profileTitle,
-                    style = androidx.compose.material3.MaterialTheme.typography.displayMedium,
-                    color = androidx.compose.material3.MaterialTheme.colorScheme.onBackground
+                    style = MaterialTheme.typography.displayMedium,
+                    color = MaterialTheme.colorScheme.onBackground
                 )
 
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    IconButton(
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    GlassCircleButton(
                         onClick = onThemeToggle,
-                        modifier = Modifier
-                            .background(androidx.compose.material3.MaterialTheme.colorScheme.surface.copy(alpha = 0.5f), androidx.compose.foundation.shape.CircleShape)
+                        clickLabel = strings.btnTheme
                     ) {
+                        // The glyph rotates through the swap so the toggle feels physical
+                        val themeRotation by animateFloatAsState(
+                            targetValue = if (isDarkTheme) 0f else 180f,
+                            animationSpec = spring(dampingRatio = 0.6f, stiffness = 260f),
+                            label = "themeRotation"
+                        )
                         Icon(
                             imageVector = if (isDarkTheme) Icons.Default.DarkMode else Icons.Default.LightMode,
                             contentDescription = strings.btnTheme,
-                            tint = androidx.compose.material3.MaterialTheme.colorScheme.primary
+                            tint = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier
+                                .size(20.dp)
+                                .graphicsLayer { rotationZ = themeRotation }
                         )
                     }
 
-                    Spacer(modifier = Modifier.width(8.dp))
-
-                    TextButton(
+                    GlassCircleButton(
                         onClick = onLanguageToggle,
-                        modifier = Modifier
-                            .background(androidx.compose.material3.MaterialTheme.colorScheme.surface.copy(alpha = 0.5f), androidx.compose.foundation.shape.CircleShape)
+                        clickLabel = strings.btnLanguage
                     ) {
                         Text(
-                            text = language,
-                            color = androidx.compose.material3.MaterialTheme.colorScheme.primary,
+                            text = language.uppercase(Locale.getDefault()),
+                            color = MaterialTheme.colorScheme.primary,
                             fontWeight = FontWeight.Bold,
-                            fontSize = 14.sp
+                            fontSize = 13.sp,
+                            letterSpacing = 0.4.sp
                         )
                     }
                 }
             }
 
-            // Scrollable Content
+            // ─── SCROLLABLE CONTENT ───
             Column(
                 modifier = Modifier
                     .fillMaxSize()
-                    .padding(horizontal = 24.dp)
-                    .verticalScroll(rememberScrollState()),
-                horizontalAlignment = Alignment.CenterHorizontally
+                    .verticalScroll(rememberScrollState())
+                    .padding(horizontal = 16.dp)
+                    .padding(bottom = 110.dp) // room for the floating bottom nav
             ) {
-                // Avatar
-            Box(contentAlignment = Alignment.BottomEnd) {
-                Box(
-                    modifier = Modifier
-                        .size(100.dp)
-                        .clip(androidx.compose.foundation.shape.CircleShape)
-                        .background(com.flasskdev.vibe.ui.theme.VibePrimary)
-                        .clickable { showAvatarDialog = true },
-                    contentAlignment = Alignment.Center
-                ) {
-                    if (!user?.avatarUrl.isNullOrEmpty()) {
-                        AsyncImage(
-                            model = ImageRequest.Builder(context)
-                                .data(user?.avatarUrl)
-                                .crossfade(true)
-                                .build(),
-                            contentDescription = "Avatar",
-                            contentScale = ContentScale.Crop,
-                            modifier = Modifier.fillMaxSize()
-                        )
-                    } else {
-                        Text(
-                            text = displayName.take(1).uppercase(),
-                            color = Color.White,
-                            fontSize = 40.sp,
-                            fontWeight = FontWeight.Bold
-                        )
-                    }
-                }
-                Box(
-                    modifier = Modifier
-                        .size(32.dp)
-                        .clip(androidx.compose.foundation.shape.CircleShape)
-                        .background(androidx.compose.material3.MaterialTheme.colorScheme.background)
-                        .clickable { showAvatarDialog = true },
-                    contentAlignment = Alignment.Center
-                ) {
-                    Box(
-                        modifier = Modifier
-                            .size(28.dp)
-                            .clip(androidx.compose.foundation.shape.CircleShape)
-                            .background(com.flasskdev.vibe.ui.theme.VibePrimary),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.PhotoCamera,
-                            contentDescription = "Edit Avatar",
-                            tint = Color.White,
-                            modifier = Modifier.size(16.dp)
-                        )
-                    }
-                }
-            }
-
-            Spacer(modifier = Modifier.height(16.dp))
-
-            // Name
-            Text(
-                text = displayName,
-                modifier = if (displayName.length > 24) Modifier.basicMarquee() else Modifier,
-                style = androidx.compose.material3.MaterialTheme.typography.headlineLarge,
-                color = androidx.compose.material3.MaterialTheme.colorScheme.onBackground,
-                maxLines = 1
-            )
-
-            // Username
-            Text(
-                text = usernameText,
-                modifier = Modifier.combinedClickable(
-                    onClick = {},
-                    onLongClick = {
-                        clipboardManager.setText(AnnotatedString(usernameText))
-                        showCopyToast = true
-                    }
-                ),
-                color = androidx.compose.material3.MaterialTheme.colorScheme.primary,
-                fontSize = 16.sp,
-                fontWeight = FontWeight.Medium,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis
-            )
-
-            Spacer(modifier = Modifier.height(16.dp))
-
-            // Badges
-            UserBadgesRow(
-                isVerified = user?.isVerified == true,
-                isDeveloper = user?.isDeveloper == true,
-                isBot = user?.isBot == true,
-                isBanned = user?.isBanned == true,
-                isFreezed = user?.isFreezed == true
-            )
-
-            Spacer(modifier = Modifier.height(32.dp))
-
-            if (!user?.about.isNullOrBlank()) {
+                // ══ HERO CARD ══
                 Surface(
                     modifier = Modifier.fillMaxWidth(),
-                    shape = RoundedCornerShape(16.dp),
-                    color = androidx.compose.material3.MaterialTheme.colorScheme.surface,
-                    shadowElevation = 0.dp
+                    shape = RoundedCornerShape(32.dp),
+                    color = MaterialTheme.colorScheme.surface.copy(alpha = if (isDark) 0.72f else 0.92f),
+                    shadowElevation = 0.dp,
+                    border = BorderStroke(
+                        width = 0.8.dp,
+                        brush = Brush.verticalGradient(
+                            colors = listOf(
+                                Color.White.copy(alpha = if (isDark) 0.16f else 0.55f),
+                                MaterialTheme.colorScheme.onSurface.copy(alpha = 0.05f)
+                            )
+                        )
+                    )
                 ) {
+                    Column(
+                        modifier = Modifier
+                            .background(
+                                Brush.verticalGradient(
+                                    colors = listOf(
+                                        primary.copy(alpha = if (isDark) 0.10f else 0.06f),
+                                        Color.Transparent
+                                    )
+                                )
+                            )
+                            .padding(horizontal = 20.dp, vertical = 24.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally
+                    ) {
+                        // ── Avatar: gradient ring + outer glow + camera FAB ──
+                        Box(contentAlignment = Alignment.BottomEnd) {
+                            Box(
+                                modifier = Modifier.size(124.dp),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Box(
+                                    modifier = Modifier
+                                        .matchParentSize()
+                                        .background(
+                                            Brush.radialGradient(
+                                                colors = listOf(
+                                                    primary.copy(alpha = 0.26f),
+                                                    Color.Transparent
+                                                )
+                                            ),
+                                            CircleShape
+                                        )
+                                )
+                                Box(
+                                    modifier = Modifier
+                                        .size(112.dp)
+                                        .background(
+                                            Brush.sweepGradient(
+                                                colors = listOf(
+                                                    primary,
+                                                    Color(0xFF5AC8FA),
+                                                    Color(0xFFAF52DE),
+                                                    primary
+                                                )
+                                            ),
+                                            CircleShape
+                                        )
+                                        .padding(2.5.dp)
+                                        .background(MaterialTheme.colorScheme.surface, CircleShape)
+                                        .padding(2.5.dp),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Box(
+                                        modifier = Modifier
+                                            .fillMaxSize()
+                                            .clip(CircleShape)
+                                            .background(
+                                                Brush.linearGradient(
+                                                    colors = listOf(
+                                                        com.flasskdev.vibe.ui.theme.VibePrimary,
+                                                        com.flasskdev.vibe.ui.theme.VibePrimary.copy(alpha = 0.72f)
+                                                    )
+                                                )
+                                            )
+                                            .clickable { showAvatarDialog = true },
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        if (!user?.avatarUrl.isNullOrEmpty()) {
+                                            AsyncImage(
+                                                model = ImageRequest.Builder(context)
+                                                    .data(user?.avatarUrl)
+                                                    .crossfade(true)
+                                                    .build(),
+                                                contentDescription = strings.a11yAvatar,
+                                                contentScale = ContentScale.Crop,
+                                                modifier = Modifier.fillMaxSize()
+                                            )
+                                        } else {
+                                            Text(
+                                                text = displayName.take(1).uppercase(),
+                                                color = Color.White,
+                                                fontSize = 42.sp,
+                                                fontWeight = FontWeight.Bold
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+
+                            Box(
+                                modifier = Modifier
+                                    .size(36.dp)
+                                    .clip(CircleShape)
+                                    .background(MaterialTheme.colorScheme.surface)
+                                    .clickable { showAvatarDialog = true },
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Box(
+                                    modifier = Modifier
+                                        .size(30.dp)
+                                        .clip(CircleShape)
+                                        .background(
+                                            Brush.linearGradient(
+                                                colors = listOf(primary, primary.copy(alpha = 0.78f))
+                                            )
+                                        ),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.PhotoCamera,
+                                        contentDescription = strings.a11yEditAvatar,
+                                        tint = Color.White,
+                                        modifier = Modifier.size(16.dp)
+                                    )
+                                }
+                            }
+                        }
+
+                        Spacer(modifier = Modifier.height(18.dp))
+
+                        Text(
+                            text = displayName,
+                            modifier = if (displayName.length > 24) Modifier.basicMarquee() else Modifier,
+                            style = MaterialTheme.typography.headlineLarge,
+                            color = MaterialTheme.colorScheme.onBackground,
+                            textAlign = TextAlign.Center,
+                            maxLines = 1
+                        )
+
+                        Spacer(modifier = Modifier.height(10.dp))
+
+                        // ── Username pill: tap or long-press to copy ──
+                        Surface(
+                            shape = RoundedCornerShape(percent = 50),
+                            color = primary.copy(alpha = if (isDark) 0.18f else 0.10f),
+                            modifier = Modifier.combinedClickable(
+                                onClickLabel = strings.profileCopyUsername,
+                                onClick = {
+                                    clipboardManager.setText(AnnotatedString(usernameText))
+                                    showCopyToast = true
+                                },
+                                onLongClick = {
+                                    clipboardManager.setText(AnnotatedString(usernameText))
+                                    showCopyToast = true
+                                }
+                            )
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 14.dp, vertical = 7.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = usernameText,
+                                    color = MaterialTheme.colorScheme.primary,
+                                    fontSize = 15.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Icon(
+                                    imageVector = Icons.Default.ContentCopy,
+                                    contentDescription = strings.profileCopyUsername,
+                                    tint = MaterialTheme.colorScheme.primary.copy(alpha = 0.75f),
+                                    modifier = Modifier.size(14.dp)
+                                )
+                            }
+                        }
+
+                        Spacer(modifier = Modifier.height(6.dp))
+
+                        Text(
+                            text = strings.profileCopyUsernameHint,
+                            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.45f),
+                            fontSize = 11.sp,
+                            textAlign = TextAlign.Center
+                        )
+
+                        val hasBadges = user?.isVerified == true || user?.isDeveloper == true ||
+                                user?.isBot == true || user?.isBanned == true || user?.isFreezed == true
+                        if (hasBadges) {
+                            Spacer(modifier = Modifier.height(16.dp))
+                            UserBadgesRow(
+                                isVerified = user?.isVerified == true,
+                                isDeveloper = user?.isDeveloper == true,
+                                isBot = user?.isBot == true,
+                                isBanned = user?.isBanned == true,
+                                isFreezed = user?.isFreezed == true
+                            )
+                        }
+                    }
+                }
+
+                // ══ ABOUT ══
+                if (!user?.about.isNullOrBlank()) {
+                    Spacer(modifier = Modifier.height(26.dp))
+                    ProfileSectionTitle(text = strings.profileSectionInfo)
+                    Spacer(modifier = Modifier.height(8.dp))
+                    ProfileCard {
+                        Column(modifier = Modifier.padding(horizontal = 16.dp, vertical = 14.dp)) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                ProfileRowIcon(
+                                    icon = Icons.Default.Info,
+                                    tint = primary,
+                                    contentDescription = strings.aboutLabel
+                                )
+                                Spacer(modifier = Modifier.width(14.dp))
+                                Text(
+                                    text = strings.aboutLabel,
+                                    color = MaterialTheme.colorScheme.onBackground,
+                                    fontSize = 15.sp,
+                                    fontWeight = FontWeight.SemiBold
+                                )
+                            }
+                            Spacer(modifier = Modifier.height(10.dp))
+                            Text(
+                                text = user?.about ?: "",
+                                color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.78f),
+                                fontSize = 14.sp,
+                                lineHeight = 20.sp,
+                                textAlign = TextAlign.Start
+                            )
+                        }
+                    }
+                }
+
+                // ══ APPEARANCE ══
+                Spacer(modifier = Modifier.height(26.dp))
+                ProfileSectionTitle(text = strings.profileSectionAppearance)
+                Spacer(modifier = Modifier.height(8.dp))
+                ProfileCard {
+                    Column {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable(onClickLabel = strings.btnTheme, onClick = onThemeToggle)
+                                .padding(horizontal = 16.dp, vertical = 12.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            ProfileRowIcon(
+                                icon = if (isDarkTheme) Icons.Default.DarkMode else Icons.Default.LightMode,
+                                tint = Color(0xFF5E5CE6),
+                                contentDescription = null
+                            )
+                            Spacer(modifier = Modifier.width(14.dp))
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = strings.btnTheme,
+                                    color = MaterialTheme.colorScheme.onBackground,
+                                    fontSize = 15.sp,
+                                    fontWeight = FontWeight.Medium
+                                )
+                                Text(
+                                    text = if (isDarkTheme) strings.themeDark else strings.themeLight,
+                                    color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.5f),
+                                    fontSize = 12.sp
+                                )
+                            }
+                            Switch(
+                                checked = isDarkTheme,
+                                onCheckedChange = { onThemeToggle() }
+                            )
+                        }
+
+                        ProfileRowDivider()
+
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable(onClickLabel = strings.btnLanguage, onClick = onLanguageToggle)
+                                .padding(horizontal = 16.dp, vertical = 14.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            ProfileRowIcon(
+                                icon = Icons.Default.Language,
+                                tint = Color(0xFF34C759),
+                                contentDescription = null
+                            )
+                            Spacer(modifier = Modifier.width(14.dp))
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = strings.btnLanguage,
+                                    color = MaterialTheme.colorScheme.onBackground,
+                                    fontSize = 15.sp,
+                                    fontWeight = FontWeight.Medium
+                                )
+                                Text(
+                                    text = strings.languageName,
+                                    color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.5f),
+                                    fontSize = 12.sp
+                                )
+                            }
+                            Icon(
+                                imageVector = Icons.Default.ChevronRight,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.3f),
+                                modifier = Modifier.size(20.dp)
+                            )
+                        }
+                    }
+                }
+
+                // ══ SESSION ══
+                Spacer(modifier = Modifier.height(26.dp))
+                ProfileSectionTitle(text = strings.profileSectionSession)
+                Spacer(modifier = Modifier.height(8.dp))
+                ProfileCard {
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .padding(horizontal = 12.dp, vertical = 12.dp),
+                            .clickable(onClickLabel = strings.btnLogout) { showLogoutDialog = true }
+                            .padding(horizontal = 16.dp, vertical = 14.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
+                        ProfileRowIcon(
+                            icon = Icons.Rounded.Logout,
+                            tint = Color(0xFFFF3B30),
+                            contentDescription = null
+                        )
+                        Spacer(modifier = Modifier.width(14.dp))
+                        Text(
+                            text = strings.btnLogout,
+                            color = Color(0xFFFF3B30),
+                            fontSize = 16.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            modifier = Modifier.weight(1f)
+                        )
                         Icon(
-                            imageVector = Icons.Default.Info,
-                            contentDescription = strings.aboutLabel,
-                            tint = com.flasskdev.vibe.ui.theme.VibePrimary,
-                            modifier = Modifier.size(24.dp)
-                        )
-                        Spacer(modifier = Modifier.width(12.dp))
-                        Text(
-                            text = strings.aboutLabel,
-                            color = androidx.compose.material3.MaterialTheme.colorScheme.onBackground,
-                            fontSize = 14.sp,
-                            fontWeight = FontWeight.Medium
-                        )
-                        Spacer(modifier = Modifier.weight(1f))
-                        Text(
-                            text = user?.about ?: "",
-                            modifier = Modifier.padding(horizontal = 16.dp),
-                            color = androidx.compose.material3.MaterialTheme.colorScheme.onBackground.copy(alpha = 0.8f),
-                            fontSize = 14.sp,
-                            textAlign = TextAlign.Start
+                            imageVector = Icons.Default.ChevronRight,
+                            contentDescription = null,
+                            tint = Color(0xFFFF3B30).copy(alpha = 0.45f),
+                            modifier = Modifier.size(20.dp)
                         )
                     }
                 }
-                
-                Spacer(modifier = Modifier.height(16.dp))
             }
+        }
 
-
-
-            // Logout Button
-            Surface(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .clickable(onClick = { showLogoutDialog = true }),
-                shape = RoundedCornerShape(24.dp),
-                color = androidx.compose.material3.MaterialTheme.colorScheme.surface,
-                shadowElevation = 2.dp
-            ) {
-                Row(
-                    modifier = Modifier.padding(horizontal = 20.dp, vertical = 10.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
+        if (showLogoutDialog) {
+            AlertDialog(
+                onDismissRequest = { showLogoutDialog = false },
+                icon = {
                     Box(
                         modifier = Modifier
-                            .size(40.dp)
-                            .background(Color(0xFFFF3B30).copy(alpha = 0.15f), RoundedCornerShape(12.dp)),
+                            .size(48.dp)
+                            .background(Color(0xFFFF3B30).copy(alpha = 0.14f), RoundedCornerShape(16.dp)),
                         contentAlignment = Alignment.Center
                     ) {
                         Icon(
@@ -707,23 +798,7 @@ fun ProfileScreen(
                             modifier = Modifier.size(24.dp)
                         )
                     }
-                    
-                    Spacer(modifier = Modifier.width(16.dp))
-                    
-                    Text(
-                        text = strings.btnLogout,
-                        color = Color(0xFFFF3B30),
-                        fontSize = 17.sp,
-                        fontWeight = FontWeight.Bold
-                    )
-                }
-            }
-        }
-        }
-
-        if (showLogoutDialog) {
-            androidx.compose.material3.AlertDialog(
-                onDismissRequest = { showLogoutDialog = false },
+                },
                 title = {
                     Text(text = strings.logoutConfirmTitle, fontWeight = FontWeight.Bold, color = androidx.compose.material3.MaterialTheme.colorScheme.onBackground)
                 },
@@ -743,6 +818,7 @@ fun ProfileScreen(
                         Text(strings.logoutCancel, color = androidx.compose.material3.MaterialTheme.colorScheme.onBackground)
                     }
                 },
+                shape = RoundedCornerShape(28.dp),
                 containerColor = androidx.compose.material3.MaterialTheme.colorScheme.surface
             )
         }
@@ -752,7 +828,7 @@ fun ProfileScreen(
                 message = strings.usernameCopied,
                 isVisible = showCopyToast,
                 onDismiss = { showCopyToast = false },
-                modifier = Modifier.padding(bottom = 80.dp) // Offset above bottom nav bar
+                modifier = Modifier.padding(bottom = 100.dp) // Offset above bottom nav bar
             )
         }
     }
@@ -762,18 +838,19 @@ fun ProfileScreen(
         var cropOffset by remember { mutableStateOf(androidx.compose.ui.geometry.Offset.Zero) }
         var boxWidthPx by remember { mutableStateOf(0f) }
         var boxHeightPx by remember { mutableStateOf(0f) }
-        
-        androidx.compose.ui.window.Dialog(onDismissRequest = { 
-            showAvatarDialog = false 
-            selectedImageUri = null 
+
+        androidx.compose.ui.window.Dialog(onDismissRequest = {
+            showAvatarDialog = false
+            selectedImageUri = null
         }) {
             Surface(
-                shape = RoundedCornerShape(24.dp),
+                shape = RoundedCornerShape(28.dp),
                 color = androidx.compose.material3.MaterialTheme.colorScheme.surface,
+                tonalElevation = 2.dp,
                 modifier = Modifier.fillMaxWidth()
             ) {
                 Column(
-                    modifier = Modifier.padding(24.dp),
+                    modifier = Modifier.padding(horizontal = 22.dp, vertical = 24.dp),
                     horizontalAlignment = Alignment.CenterHorizontally
                 ) {
                     Text(
@@ -782,15 +859,28 @@ fun ProfileScreen(
                         fontWeight = FontWeight.Bold,
                         color = androidx.compose.material3.MaterialTheme.colorScheme.onSurface
                     )
-                    Spacer(modifier = Modifier.height(24.dp))
-                    
-                    // Рамка с кружком
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Text(
+                        text = strings.avatarCropHint,
+                        fontSize = 13.sp,
+                        lineHeight = 18.sp,
+                        textAlign = TextAlign.Center,
+                        color = androidx.compose.material3.MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f)
+                    )
+                    Spacer(modifier = Modifier.height(20.dp))
+
+                    // Crop frame: circular mask marks what actually gets uploaded
                     Box(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .height(200.dp)
-                            .background(androidx.compose.material3.MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f), RoundedCornerShape(16.dp))
-                            .clip(RoundedCornerShape(16.dp))
+                            .height(230.dp)
+                            .clip(RoundedCornerShape(20.dp))
+                            .background(androidx.compose.material3.MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f))
+                            .border(
+                                width = 1.dp,
+                                color = androidx.compose.material3.MaterialTheme.colorScheme.onSurface.copy(alpha = 0.08f),
+                                shape = RoundedCornerShape(20.dp)
+                            )
                             .clickable {
                                 launcher.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
                             }
@@ -813,7 +903,7 @@ fun ProfileScreen(
                                 }
                                 AsyncImage(
                                     model = selectedImageUri,
-                                    contentDescription = "Preview",
+                                    contentDescription = strings.a11yAvatarPreview,
                                     contentScale = ContentScale.Fit,
                                     modifier = Modifier
                                         .fillMaxSize()
@@ -836,21 +926,31 @@ fun ProfileScreen(
                                         .data(user?.avatarUrl)
                                         .crossfade(true)
                                         .build(),
-                                    contentDescription = "Preview",
+                                    contentDescription = strings.a11yAvatarPreview,
                                     contentScale = ContentScale.Crop,
-                                    modifier = Modifier.size(140.dp).clip(CircleShape)
+                                    modifier = Modifier
+                                        .size(140.dp)
+                                        .clip(CircleShape)
                                 )
                             } else {
-                                Icon(
-                                    imageVector = Icons.Default.AddPhotoAlternate,
-                                    contentDescription = "Choose photo",
-                                    modifier = Modifier.size(48.dp),
-                                    tint = androidx.compose.material3.MaterialTheme.colorScheme.onSurfaceVariant
-                                )
+                                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                    Icon(
+                                        imageVector = Icons.Default.AddPhotoAlternate,
+                                        contentDescription = strings.a11yChoosePhoto,
+                                        modifier = Modifier.size(46.dp),
+                                        tint = androidx.compose.material3.MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                    Spacer(modifier = Modifier.height(8.dp))
+                                    Text(
+                                        text = strings.avatarPickPrompt,
+                                        fontSize = 13.sp,
+                                        color = androidx.compose.material3.MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
                             }
                         }
-                        
-                        // Затенение с вырезанным кругом (оверлей)
+
+                        // Dim overlay with a punched-out circle marking the crop area
                         androidx.compose.foundation.Canvas(modifier = Modifier.fillMaxSize()) {
                             val radius = 70.dp.toPx()
                             val path = androidx.compose.ui.graphics.Path().apply {
@@ -858,32 +958,49 @@ fun ProfileScreen(
                                 addOval(androidx.compose.ui.geometry.Rect(center.x - radius, center.y - radius, center.x + radius, center.y + radius))
                                 fillType = androidx.compose.ui.graphics.PathFillType.EvenOdd
                             }
-                            drawPath(path, color = Color.Black.copy(alpha = 0.5f))
+                            drawPath(path, color = Color.Black.copy(alpha = 0.55f))
+                            drawCircle(
+                                color = Color.White.copy(alpha = 0.85f),
+                                radius = radius,
+                                style = Stroke(width = 2.dp.toPx())
+                            )
                         }
                     }
-                    
-                    Spacer(modifier = Modifier.height(24.dp))
-                    
-                    androidx.compose.material3.Button(
+
+                    Spacer(modifier = Modifier.height(20.dp))
+
+                    OutlinedButton(
                         onClick = {
                             launcher.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
                         },
-                        modifier = Modifier.fillMaxWidth(),
-                        shape = RoundedCornerShape(12.dp),
-                        colors = androidx.compose.material3.ButtonDefaults.buttonColors(containerColor = androidx.compose.material3.MaterialTheme.colorScheme.primaryContainer)
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(50.dp),
+                        shape = RoundedCornerShape(16.dp)
                     ) {
-                        Text(strings.choosePhoto, color = androidx.compose.material3.MaterialTheme.colorScheme.onPrimaryContainer, fontWeight = FontWeight.Bold)
+                        Icon(
+                            imageVector = Icons.Default.AddPhotoAlternate,
+                            contentDescription = null,
+                            modifier = Modifier.size(18.dp),
+                            tint = androidx.compose.material3.MaterialTheme.colorScheme.primary
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = strings.choosePhoto,
+                            color = androidx.compose.material3.MaterialTheme.colorScheme.primary,
+                            fontWeight = FontWeight.SemiBold
+                        )
                     }
-                    
+
                     if (selectedImageUri != null) {
-                        Spacer(modifier = Modifier.height(8.dp))
+                        Spacer(modifier = Modifier.height(10.dp))
                         val density = androidx.compose.ui.platform.LocalDensity.current
                         androidx.compose.material3.Button(
                             onClick = {
                                 val circleRadiusPx = with(density) { 70.dp.toPx() }
-                                
+
                                 val base64 = ImageUtils.compressAndEncodeImage(
-                                    context, 
+                                    context,
                                     selectedImageUri!!,
                                     scale = cropScale,
                                     offsetX = cropOffset.x,
@@ -898,11 +1015,18 @@ fun ProfileScreen(
                                 showAvatarDialog = false
                                 selectedImageUri = null
                             },
-                            modifier = Modifier.fillMaxWidth(),
-                            shape = RoundedCornerShape(12.dp),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(50.dp),
+                            shape = RoundedCornerShape(16.dp),
                             colors = androidx.compose.material3.ButtonDefaults.buttonColors(containerColor = com.flasskdev.vibe.ui.theme.VibePrimary)
                         ) {
-                            Text(strings.doneBtn, color = Color.White, fontWeight = FontWeight.Bold)
+                            Text(
+                                text = strings.doneBtn,
+                                color = Color.White,
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 16.sp
+                            )
                         }
                     }
                 }
@@ -911,17 +1035,108 @@ fun ProfileScreen(
     }
 }
 
-private fun formatComplaintsCount(count: Int, language: String): String {
+/* ─────────────────────── Profile design-system helpers ─────────────────────── */
+
+/** Circular frosted button used by the profile top bar. */
+@Composable
+private fun GlassCircleButton(
+    onClick: () -> Unit,
+    clickLabel: String,
+    content: @Composable () -> Unit
+) {
+    val isDark = MaterialTheme.colorScheme.background.luminanceIsDark()
+    Box(
+        modifier = Modifier
+            .size(42.dp)
+            .clip(CircleShape)
+            .background(MaterialTheme.colorScheme.surface.copy(alpha = if (isDark) 0.70f else 0.90f))
+            .border(
+                width = 0.7.dp,
+                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.08f),
+                shape = CircleShape
+            )
+            .clickable(onClickLabel = clickLabel, onClick = onClick),
+        contentAlignment = Alignment.Center
+    ) {
+        content()
+    }
+}
+
+/** Uppercase group label, in the grouped-iOS-settings spirit. */
+@Composable
+private fun ProfileSectionTitle(text: String) {
+    Text(
+        text = text.uppercase(Locale.getDefault()),
+        modifier = Modifier.padding(start = 8.dp),
+        fontSize = 11.sp,
+        fontWeight = FontWeight.SemiBold,
+        letterSpacing = 0.9.sp,
+        color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.45f)
+    )
+}
+
+/** Grouped card container shared by every profile section. */
+@Composable
+private fun ProfileCard(content: @Composable () -> Unit) {
+    val isDark = MaterialTheme.colorScheme.background.luminanceIsDark()
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(22.dp),
+        color = MaterialTheme.colorScheme.surface.copy(alpha = if (isDark) 0.72f else 0.94f),
+        border = BorderStroke(
+            width = 0.7.dp,
+            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.06f)
+        ),
+        shadowElevation = 0.dp
+    ) {
+        content()
+    }
+}
+
+/** Squircle icon tile, tinted per row. */
+@Composable
+private fun ProfileRowIcon(
+    icon: ImageVector,
+    tint: Color,
+    contentDescription: String?
+) {
+    Box(
+        modifier = Modifier
+            .size(38.dp)
+            .background(tint.copy(alpha = 0.14f), RoundedCornerShape(12.dp)),
+        contentAlignment = Alignment.Center
+    ) {
+        Icon(
+            imageVector = icon,
+            contentDescription = contentDescription,
+            tint = tint,
+            modifier = Modifier.size(20.dp)
+        )
+    }
+}
+
+/** Hairline divider inset to the text column, like grouped iOS lists. */
+@Composable
+private fun ProfileRowDivider() {
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(start = 68.dp)
+            .height(0.7.dp)
+            .background(MaterialTheme.colorScheme.onSurface.copy(alpha = 0.07f))
+    )
+}
+
+/**
+ * Compact "1.2 k" style counter. Unit suffixes come from the string table instead of
+ * an inline `if (isRu)` branch, so a third locale no longer needs a code change.
+ */
+private fun formatComplaintsCount(count: Int, strings: VibeStrings): String {
     if (count < 1000) return count.toString()
-    
-    val isRu = language.lowercase().startsWith("ru")
-    val kSuffix = if (isRu) "тыс." else "K"
-    val mSuffix = if (isRu) "млн." else "M"
-    val bSuffix = if (isRu) "млрд." else "B"
-    
+
     return when {
-        count < 1_000_000 -> String.format(java.util.Locale.US, "%.1f %s", count / 1000.0, kSuffix)
-        count < 1_000_000_000 -> String.format(java.util.Locale.US, "%.1f %s", count / 1_000_000.0, mSuffix)
-        else -> String.format(java.util.Locale.US, "%.1f %s", count / 1_000_000_000.0, bSuffix)
+        count < 1_000_000 -> String.format(java.util.Locale.US, "%.1f %s", count / 1000.0, strings.unitThousandShort)
+        count < 1_000_000_000 -> String.format(java.util.Locale.US, "%.1f %s", count / 1_000_000.0, strings.unitMillionShort)
+        else -> String.format(java.util.Locale.US, "%.1f %s", count / 1_000_000_000.0, strings.unitBillionShort)
     }.replace(".0", "")
 }

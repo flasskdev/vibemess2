@@ -265,7 +265,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
         
         override fun onReportSuccess(messageId: Int) {
-            viewModelScope.launch { _uiEvents.emit(ChatUiEvent.ToastEvent("Жалоба успешно отправлена")) }
+            viewModelScope.launch { _uiEvents.emit(ChatUiEvent.ToastEvent(com.flasskdev.vibe.ui.theme.VibeStringsHolder.current.reportSentToast)) }
         }
         
         override fun onSendMessageError(error: String, message: String) {
@@ -335,8 +335,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     fun pinChat(chatId: Int) {
         viewModelScope.launch(Dispatchers.IO) {
             val count = chatDao.getPinnedChatsCount()
-            if (count >= 5) {
-                _uiEvents.emit(ChatUiEvent.ToastEvent("Можно закрепить не более 5 чатов"))
+            if (count >= MAX_PINNED_CHATS) {
+                _uiEvents.emit(ChatUiEvent.ToastEvent(com.flasskdev.vibe.ui.theme.VibeStringsHolder.current.maxPinnedChatsToast(MAX_PINNED_CHATS)))
             } else {
                 chatDao.updatePinnedStatus(chatId, true)
             }
@@ -453,6 +453,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     companion object {
+        /** Лимит закреплённых чатов. Раньше 5 было зашито и в условии, и в тексте тоста. */
+        const val MAX_PINNED_CHATS = 5
+
         private val timestampFormatter = ThreadLocal.withInitial {
             java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", java.util.Locale.US).apply {
                 timeZone = java.util.TimeZone.getTimeZone("Europe/Paris")

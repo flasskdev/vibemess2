@@ -192,6 +192,11 @@ interface VibeWebSocketListener {
     fun onSendMessageError(error: String, message: String) {}
     fun onMessageReaction(messageId: Int, userId: Int, emoji: String, reactions: List<com.flasskdev.vibe.data.local.ReactionItem>) {}
     fun onReactionUsersResult(messageId: Int, emoji: String?, offset: Int, hasMore: Boolean, users: List<ReactionUserDetail>) {}
+    fun onStickerPacksResult(packsJson: JSONArray) {}
+    fun onStickerPacksSearchResult(query: String, packsJson: JSONArray) {}
+    fun onStickerPackAdded(packId: Int) {}
+    fun onStickerPackRemoved(packId: Int) {}
+    fun onStickerPackError(error: String, message: String) {}
 }
 
 class VibeWebSocket {
@@ -444,6 +449,28 @@ class VibeWebSocket {
                         "blocked_count_result" -> {
                             val count = obj.optInt("count", 0)
                             listeners.forEach { it.onBlockedCountResult(count) }
+                        }
+                        "sticker_packs_result" -> {
+                            val packs = obj.optJSONArray("packs") ?: JSONArray()
+                            listeners.forEach { it.onStickerPacksResult(packs) }
+                        }
+                        "sticker_packs_search_result" -> {
+                            val query = obj.optString("query", "")
+                            val packs = obj.optJSONArray("packs") ?: JSONArray()
+                            listeners.forEach { it.onStickerPacksSearchResult(query, packs) }
+                        }
+                        "sticker_pack_added" -> {
+                            val packId = obj.optInt("pack_id", 0)
+                            listeners.forEach { it.onStickerPackAdded(packId) }
+                        }
+                        "sticker_pack_removed" -> {
+                            val packId = obj.optInt("pack_id", 0)
+                            listeners.forEach { it.onStickerPackRemoved(packId) }
+                        }
+                        "sticker_pack_error" -> {
+                            val error = obj.optString("error", "")
+                            val message = obj.optString("message", "")
+                            listeners.forEach { it.onStickerPackError(error, message) }
                         }
                         "avatar_uploaded" -> {
                             val uid = obj.optInt("user_id", 0)
@@ -1049,6 +1076,41 @@ class VibeWebSocket {
         val msg = JSONObject().apply {
             put("type", "get_blocked_count")
             put("user_id", userId)
+        }
+        sendRawJson(msg.toString())
+    }
+
+    fun getStickerPacks(userId: Int) {
+        val msg = JSONObject().apply {
+            put("type", "get_sticker_packs")
+            put("user_id", userId)
+        }
+        sendRawJson(msg.toString())
+    }
+
+    fun searchStickerPacks(query: String, userId: Int) {
+        val msg = JSONObject().apply {
+            put("type", "search_sticker_packs")
+            put("user_id", userId)
+            put("query", query)
+        }
+        sendRawJson(msg.toString())
+    }
+
+    fun addStickerPack(userId: Int, packId: Int) {
+        val msg = JSONObject().apply {
+            put("type", "add_sticker_pack")
+            put("user_id", userId)
+            put("pack_id", packId)
+        }
+        sendRawJson(msg.toString())
+    }
+
+    fun removeStickerPack(userId: Int, packId: Int) {
+        val msg = JSONObject().apply {
+            put("type", "remove_sticker_pack")
+            put("user_id", userId)
+            put("pack_id", packId)
         }
         sendRawJson(msg.toString())
     }

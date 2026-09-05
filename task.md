@@ -1,6 +1,0 @@
-- [x] Fix VibeMessage in VibeWebSocket.kt
-- [x] Update `updateProfile` in VibeWebSocket.kt to map about -> content
-- [x] Fix placeholder typography in `EditProfileFieldContent.kt`
-- [x] Add `icon` and `errorMessage` props to `EditProfileFieldContent.kt` and render them
-- [x] Add username availability listener to `SettingsScreen.kt` for `edit_username`
-- [x] Pass `icon` and `errorMessage` to `edit_username` and `edit_nickname` from `SettingsScreen.kt`

@@ -44,14 +44,12 @@ fun StickerMessage(
     isPending: Boolean
 ) {
     val context = LocalContext.current
-    val loader = rememberAnimatedImageLoader()
     Box(contentAlignment = Alignment.BottomEnd) {
         AsyncImage(
             model = ImageRequest.Builder(context)
                 .data(StickerRepository.assetUri(stickerId))
                 .crossfade(true)
                 .build(),
-            imageLoader = loader,
             contentDescription = "Стикер",
             contentScale = ContentScale.Fit,
             modifier = Modifier.size(140.dp)
@@ -75,7 +73,6 @@ fun GifMessage(
     onClick: () -> Unit = {}
 ) {
     val context = LocalContext.current
-    val loader = rememberAnimatedImageLoader()
 
     val dims = meta.removePrefix("gif:").split("x")
     val w = dims.getOrNull(0)?.toIntOrNull() ?: 0
@@ -95,7 +92,6 @@ fun GifMessage(
                 .data(url)
                 .crossfade(true)
                 .build(),
-            imageLoader = loader,
             contentDescription = "GIF",
             contentScale = ContentScale.FillWidth,
             modifier = Modifier

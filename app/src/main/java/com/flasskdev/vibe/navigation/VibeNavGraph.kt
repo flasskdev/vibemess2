@@ -204,7 +204,13 @@ fun VibeNavGraph(
                 }
             )
         }
-        composable(Screen.PasscodeAuth.route) {
+        composable(
+            route = Screen.PasscodeAuth.route,
+            enterTransition = { EnterTransition.None },
+            exitTransition = { ExitTransition.None },
+            popEnterTransition = { EnterTransition.None },
+            popExitTransition = { ExitTransition.None }
+        ) {
             PasscodeAuthScreen(
                 userPreferences = userPreferences,
                 onSuccess = {
@@ -223,7 +229,13 @@ fun VibeNavGraph(
                 }
             )
         }
-        composable(Screen.PasscodeSetup.route) {
+        composable(
+            route = Screen.PasscodeSetup.route,
+            enterTransition = { EnterTransition.None },
+            exitTransition = { ExitTransition.None },
+            popEnterTransition = { EnterTransition.None },
+            popExitTransition = { ExitTransition.None }
+        ) {
             PasscodeSetupScreen(
                 userPreferences = userPreferences,
                 onBack = { navController.popBackStack() }

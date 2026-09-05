@@ -251,6 +251,30 @@ class Chat implements MessageComponentInterface {
             }
 
             try {
+                $this->db->exec("CREATE TABLE IF NOT EXISTS flasskdev_mobilestickerpacks (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    name VARCHAR(128) NOT NULL,
+                    owner INT NOT NULL,
+                    stickers LONGTEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    INDEX idx_sticker_packs_owner (owner),
+                    INDEX idx_sticker_packs_name (name)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;");
+                $this->db->exec("CREATE TABLE IF NOT EXISTS flasskdev_mobileuserstickerpacks (
+                    user_id INT NOT NULL,
+                    pack_id INT NOT NULL,
+                    position INT NOT NULL DEFAULT 0,
+                    installed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (user_id, pack_id),
+                    INDEX idx_user_sticker_packs_position (user_id, position),
+                    INDEX idx_user_sticker_packs_pack (pack_id)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;");
+            } catch (\PDOException $e) {
+                echo "[DB Error sticker packs] " . $e->getMessage() . "\n";
+            }
+
+            try {
                 $this->db->exec("CREATE TABLE IF NOT EXISTS bot_updates (
                     id INT AUTO_INCREMENT PRIMARY KEY,
                     bot_id INT NOT NULL,
@@ -378,6 +402,48 @@ class Chat implements MessageComponentInterface {
             $this->connectDB();
         }
         return $this->db;
+    }
+
+    private function decodeStickers($raw) {
+        $list = json_decode($raw ?: '[]', true);
+        if (!is_array($list)) return [];
+
+        $stickers = [];
+        foreach ($list as $sticker) {
+            if (is_string($sticker) && $sticker !== '') {
+                $stickers[] = [
+                    'id' => (string)count($stickers),
+                    'path' => $sticker
+                ];
+            } elseif (is_array($sticker) && isset($sticker['path']) && is_string($sticker['path']) && $sticker['path'] !== '') {
+                $stickers[] = [
+                    'id' => (string)($sticker['id'] ?? count($stickers)),
+                    'path' => $sticker['path']
+                ];
+            }
+        }
+        return $stickers;
+    }
+
+    private function stickerPackRow($row, $isInstalled, $currentUserId) {
+        $stickers = $this->decodeStickers($row['stickers'] ?? '[]');
+        return [
+            'id' => (int)$row['id'],
+            'name' => (string)$row['name'],
+            'owner' => (int)$row['owner'],
+            'is_owner' => ((int)$row['owner'] === (int)$currentUserId),
+            'is_installed' => (bool)$isInstalled,
+            'sticker_count' => count($stickers),
+            'stickers' => $stickers
+        ];
+    }
+
+    private function sendStickerPackError($from, $error, $message) {
+        $from->send(json_encode([
+            'type' => 'sticker_pack_error',
+            'error' => $error,
+            'message' => $message
+        ], JSON_UNESCAPED_UNICODE));
     }
 
     private function sendToUser($userId, $data) {
@@ -2049,6 +2115,7 @@ class Chat implements MessageComponentInterface {
             return;
         }
 
+
         // ==========================================
         // 5.6. ОТКРЕПЛЕНИЕ ВСЕХ СООБЩЕНИЙ
         // ==========================================
@@ -2362,7 +2429,188 @@ class Chat implements MessageComponentInterface {
         }
 
         // ==========================================
-        // 10. ПОИСК ПОЛЬЗОВАТЕЛЕЙ
+        // 10. СТИКЕРПАКИ
+        // ==========================================
+        if (isset($data['type']) && $data['type'] === 'get_sticker_packs') {
+            $userId = isset($from->vibeUserId) ? (int)$from->vibeUserId : 0;
+            if ($userId <= 0) {
+                $this->sendStickerPackError($from, 'unauthorized', 'Сначала подключитесь к серверу');
+                return;
+            }
+
+            try {
+                $stmt = $this->getDB()->prepare("
+                    SELECT p.*, COALESCE(up.position, 0) AS position
+                    FROM flasskdev_mobilestickerpacks p
+                    LEFT JOIN flasskdev_mobileuserstickerpacks up
+                        ON up.pack_id = p.id AND up.user_id = ?
+                    WHERE p.owner = ? OR up.user_id IS NOT NULL
+                    ORDER BY CASE WHEN p.owner = ? THEN 0 ELSE 1 END, position ASC, p.id ASC
+                ");
+                $stmt->execute([$userId, $userId, $userId]);
+                $rows = $stmt->fetchAll();
+
+                $packs = [];
+                foreach ($rows as $row) {
+                    $packs[] = $this->stickerPackRow($row, true, $userId);
+                }
+                $from->send(json_encode([
+                    'type' => 'sticker_packs_result',
+                    'packs' => $packs
+                ], JSON_UNESCAPED_UNICODE));
+            } catch (\PDOException $e) {
+                echo "[DB Error getStickerPacks] " . $e->getMessage() . "\n";
+                $this->sendStickerPackError($from, 'database_error', 'Не удалось загрузить стикерпаки');
+            }
+            return;
+        }
+
+        if (isset($data['type']) && $data['type'] === 'search_sticker_packs') {
+            $userId = isset($from->vibeUserId) ? (int)$from->vibeUserId : 0;
+            $query = trim((string)($data['query'] ?? ''));
+            if ($userId <= 0) {
+                $this->sendStickerPackError($from, 'unauthorized', 'Сначала подключитесь к серверу');
+                return;
+            }
+            $query = function_exists('mb_substr') ? mb_substr($query, 0, 64) : substr($query, 0, 64);
+
+            try {
+                if ($query === '') {
+                    $stmt = $this->getDB()->prepare("
+                        SELECT p.*, (up.user_id IS NOT NULL) AS installed,
+                            (SELECT COUNT(*) FROM flasskdev_mobileuserstickerpacks x WHERE x.pack_id = p.id) AS installs
+                        FROM flasskdev_mobilestickerpacks p
+                        LEFT JOIN flasskdev_mobileuserstickerpacks up
+                            ON up.pack_id = p.id AND up.user_id = ?
+                        ORDER BY installs DESC, p.id DESC
+                        LIMIT 30
+                    ");
+                    $stmt->execute([$userId]);
+                } else {
+                    $stmt = $this->getDB()->prepare("
+                        SELECT p.*, (up.user_id IS NOT NULL) AS installed
+                        FROM flasskdev_mobilestickerpacks p
+                        LEFT JOIN flasskdev_mobileuserstickerpacks up
+                            ON up.pack_id = p.id AND up.user_id = ?
+                        WHERE p.name LIKE ?
+                        ORDER BY (p.name = ?) DESC, CHAR_LENGTH(p.name) ASC, p.id DESC
+                        LIMIT 30
+                    ");
+                    $stmt->execute([$userId, '%' . $query . '%', $query]);
+                }
+
+                $packs = [];
+                foreach ($stmt->fetchAll() as $row) {
+                    $installed = ((int)($row['installed'] ?? 0) === 1) || ((int)$row['owner'] === $userId);
+                    $packs[] = $this->stickerPackRow($row, $installed, $userId);
+                }
+                $from->send(json_encode([
+                    'type' => 'sticker_packs_search_result',
+                    'query' => $query,
+                    'packs' => $packs
+                ], JSON_UNESCAPED_UNICODE));
+            } catch (\PDOException $e) {
+                echo "[DB Error searchStickerPacks] " . $e->getMessage() . "\n";
+                $this->sendStickerPackError($from, 'database_error', 'Не удалось найти стикерпаки');
+            }
+            return;
+        }
+
+        if (isset($data['type']) && $data['type'] === 'add_sticker_pack') {
+            $userId = isset($from->vibeUserId) ? (int)$from->vibeUserId : 0;
+            $packId = (int)($data['pack_id'] ?? 0);
+            if ($userId <= 0) {
+                $this->sendStickerPackError($from, 'unauthorized', 'Сначала подключитесь к серверу');
+                return;
+            }
+            if ($packId <= 0) {
+                $this->sendStickerPackError($from, 'invalid_pack', 'Некорректный идентификатор стикерпака');
+                return;
+            }
+
+            try {
+                $db = $this->getDB();
+                $check = $db->prepare("SELECT owner FROM flasskdev_mobilestickerpacks WHERE id = ? LIMIT 1");
+                $check->execute([$packId]);
+                $ownerId = $check->fetchColumn();
+                if ($ownerId === false) {
+                    $this->sendStickerPackError($from, 'not_found', 'Стикерпак не найден');
+                    return;
+                }
+
+                // Owner packs are already available without an installation row.
+                if ((int)$ownerId !== $userId) {
+                    $positionStmt = $db->prepare("SELECT COALESCE(MAX(position), 0) + 1 FROM flasskdev_mobileuserstickerpacks WHERE user_id = ?");
+                    $positionStmt->execute([$userId]);
+                    $position = (int)$positionStmt->fetchColumn();
+
+                    $install = $db->prepare("
+                        INSERT INTO flasskdev_mobileuserstickerpacks (user_id, pack_id, position)
+                        VALUES (?, ?, ?)
+                        ON DUPLICATE KEY UPDATE position = position
+                    ");
+                    $install->execute([$userId, $packId, $position]);
+                }
+
+                $from->send(json_encode([
+                    'type' => 'sticker_pack_added',
+                    'pack_id' => $packId
+                ], JSON_UNESCAPED_UNICODE));
+            } catch (\PDOException $e) {
+                echo "[DB Error addStickerPack] " . $e->getMessage() . "\n";
+                $this->sendStickerPackError($from, 'database_error', 'Не удалось добавить стикерпак');
+            }
+            return;
+        }
+
+        if (isset($data['type']) && $data['type'] === 'remove_sticker_pack') {
+            $userId = isset($from->vibeUserId) ? (int)$from->vibeUserId : 0;
+            $packId = (int)($data['pack_id'] ?? 0);
+            if ($userId <= 0) {
+                $this->sendStickerPackError($from, 'unauthorized', 'Сначала подключитесь к серверу');
+                return;
+            }
+            if ($packId <= 0) {
+                $this->sendStickerPackError($from, 'invalid_pack', 'Некорректный идентификатор стикерпака');
+                return;
+            }
+
+            try {
+                $db = $this->getDB();
+                $ownerStmt = $db->prepare("SELECT owner FROM flasskdev_mobilestickerpacks WHERE id = ? LIMIT 1");
+                $ownerStmt->execute([$packId]);
+                $ownerId = $ownerStmt->fetchColumn();
+                if ($ownerId === false) {
+                    $this->sendStickerPackError($from, 'not_found', 'Стикерпак не найден');
+                    return;
+                }
+
+                $db->beginTransaction();
+                if ((int)$ownerId === $userId) {
+                    $deleteInstalls = $db->prepare("DELETE FROM flasskdev_mobileuserstickerpacks WHERE pack_id = ?");
+                    $deleteInstalls->execute([$packId]);
+                    $deletePack = $db->prepare("DELETE FROM flasskdev_mobilestickerpacks WHERE id = ? AND owner = ?");
+                    $deletePack->execute([$packId, $userId]);
+                } else {
+                    $deleteInstall = $db->prepare("DELETE FROM flasskdev_mobileuserstickerpacks WHERE user_id = ? AND pack_id = ?");
+                    $deleteInstall->execute([$userId, $packId]);
+                }
+                $db->commit();
+
+                $from->send(json_encode([
+                    'type' => 'sticker_pack_removed',
+                    'pack_id' => $packId
+                ], JSON_UNESCAPED_UNICODE));
+            } catch (\PDOException $e) {
+                if (isset($db) && $db->inTransaction()) $db->rollBack();
+                echo "[DB Error removeStickerPack] " . $e->getMessage() . "\n";
+                $this->sendStickerPackError($from, 'database_error', 'Не удалось удалить стикерпак');
+            }
+            return;
+        }
+
+        // ==========================================
+        // 11. ПОИСК ПОЛЬЗОВАТЕЛЕЙ
         // ==========================================
         if (isset($data['type']) && $data['type'] == 'search_users') {
             $query = trim($data['query'] ?? '');
