@@ -168,6 +168,7 @@ fun VibeTopGlow(
     modifier: Modifier = Modifier,
     height: Dp = 380.dp
 ) {
+    if (!VibeEffects.glowEnabled) return
     val isDark = MaterialTheme.colorScheme.background.luminanceIsDark()
     // Тёмная тема: насыщенный синий (#0A84FF)
     // Светлая тема: благородный индиго/фиолетовый (#6366F1)
@@ -191,4 +192,4 @@ fun VibeTopGlow(
                 )
             )
     )
-}
+}

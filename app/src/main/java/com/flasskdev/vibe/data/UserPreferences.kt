@@ -150,6 +150,53 @@ class UserPreferences(context: Context) {
         get() = prefs.getString(KEY_PASSCODE, null)
         set(value) = prefs.edit().putString(KEY_PASSCODE, value).apply()
 
+    var powerSaving: Boolean
+        get() = prefs.getBoolean("power_manual", false)
+        set(value) = prefs.edit().putBoolean("power_manual", value).apply()
+    var powerAutomatic: Boolean
+        get() = prefs.getBoolean("power_automatic", false)
+        set(value) = prefs.edit().putBoolean("power_automatic", value).apply()
+    var powerDisableLiquid: Boolean
+        get() = prefs.getBoolean("power_disable_liquid", true)
+        set(value) = prefs.edit().putBoolean("power_disable_liquid", value).apply()
+    var powerDisableBlur: Boolean
+        get() = prefs.getBoolean("power_disable_blur", true)
+        set(value) = prefs.edit().putBoolean("power_disable_blur", value).apply()
+    var powerDisableGlow: Boolean
+        get() = prefs.getBoolean("power_disable_glow", true)
+        set(value) = prefs.edit().putBoolean("power_disable_glow", value).apply()
+    var powerDisablePreviews: Boolean
+        get() = prefs.getBoolean("power_disable_previews", true)
+        set(value) = prefs.edit().putBoolean("power_disable_previews", value).apply()
+    var powerThreshold: Int
+        get() = prefs.getInt("power_threshold", 20).coerceIn(1, 100)
+        set(value) = prefs.edit().putInt("power_threshold", value.coerceIn(1, 100)).apply()
+
+    var sessionToken: String?
+        get() = prefs.getString("session_token", null)
+        set(value) = prefs.edit().putString("session_token", value).apply()
+
+    var twoFactorEnabled: Boolean
+        get() = prefs.getBoolean("server_two_factor_enabled", false)
+        set(value) = prefs.edit().putBoolean("server_two_factor_enabled", value).apply()
+
+    var notificationMuteAll: Boolean
+        get() = prefs.getBoolean("notification_mute_all", false)
+        set(value) = prefs.edit().putBoolean("notification_mute_all", value).apply()
+    var autoMuteNewChats: Boolean
+        get() = prefs.getBoolean("auto_mute_new", false)
+        set(value) = prefs.edit().putBoolean("auto_mute_new", value).apply()
+    var notificationSound: String
+        get() = prefs.getString("notification_sound", "default") ?: "default"
+        set(value) = prefs.edit().putString("notification_sound", value).apply()
+    var mutedNotificationPeers: Set<String>
+        get() = prefs.getStringSet("muted_notification_peers", emptySet())?.toSet() ?: emptySet()
+        set(value) = prefs.edit().putStringSet("muted_notification_peers", value).apply()
+
+    fun observe(listener: SharedPreferences.OnSharedPreferenceChangeListener) = prefs.registerOnSharedPreferenceChangeListener(listener)
+    fun unobserve(listener: SharedPreferences.OnSharedPreferenceChangeListener) = prefs.unregisterOnSharedPreferenceChangeListener(listener)
+
+    @Deprecated("Only retained to remove obsolete local-only 2FA; never use for authentication")
     var twoFactorPassword: String?
         get() = prefs.getString(KEY_TWO_FACTOR_PASSWORD, null)
         set(value) = prefs.edit().putString(KEY_TWO_FACTOR_PASSWORD, value).apply()
@@ -175,7 +222,7 @@ class UserPreferences(context: Context) {
         set(value) = prefs.edit().putString(KEY_NAME, value).apply()
 
     val isLoggedIn: Boolean
-        get() = prefs.getBoolean(KEY_IS_LOGGED_IN, false) && userId > 0
+        get() = prefs.getBoolean(KEY_IS_LOGGED_IN, false) && userId > 0 && !sessionToken.isNullOrBlank()
 
     var privacyActivity: String
         get() = prefs.getString(KEY_PRIVACY_ACTIVITY, "EVERYONE") ?: "EVERYONE"

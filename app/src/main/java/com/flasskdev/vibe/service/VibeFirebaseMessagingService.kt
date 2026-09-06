@@ -20,15 +20,17 @@ class VibeFirebaseMessagingService : FirebaseMessagingService() {
 
     override fun onNewToken(token: String) {
         super.onNewToken(token)
-        Log.d(TAG, "New FCM token: $token")
+        Log.d(TAG, "FCM registration token changed")
         // Токен будет отправлен на сервер при следующем auth_connect
     }
 
     override fun onMessageReceived(message: RemoteMessage) {
         super.onMessageReceived(message)
-        Log.d(TAG, "FCM message received: ${message.data}")
+        Log.d(TAG, "FCM data message received")
 
         val data = message.data
+        val prefs = UserPreferences(this)
+        if (!prefs.isLoggedIn || data["receiver_id"]?.toIntOrNull() != prefs.userId) return
         val action = data["action"] ?: "new"
         val senderName = data["sender_name"] ?: return
         val content = data["content"] ?: return

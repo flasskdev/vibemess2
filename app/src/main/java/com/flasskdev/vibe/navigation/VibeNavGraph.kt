@@ -2,6 +2,7 @@ package com.flasskdev.vibe.navigation
 
 import androidx.compose.animation.*
 import androidx.compose.animation.core.tween
+import kotlinx.coroutines.launch
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.window.DialogProperties
 import androidx.navigation.NavHostController
@@ -46,6 +47,27 @@ fun VibeNavGraph(
     language: String,
     onLanguageToggle: () -> Unit
 ) {
+    val logoutScope = androidx.compose.runtime.rememberCoroutineScope()
+    fun finishLogout() {
+        logoutScope.launch {
+            com.flasskdev.vibe.MainActivity.isUnlocked = false
+            webSocket.logout()
+            androidx.core.app.NotificationManagerCompat.from(navController.context).cancelAll()
+            runCatching {
+                kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                    com.flasskdev.vibe.data.local.AppDatabase.getDatabase(navController.context).clearAllTables()
+                }
+            }.onFailure { android.util.Log.e("VibeAuth", "Local cache cleanup failed") }
+            navController.navigate(Screen.Auth.route) { popUpTo(0) { inclusive = true }; launchSingleTop = true }
+        }
+    }
+    androidx.compose.runtime.DisposableEffect(webSocket) {
+        val listener = object : com.flasskdev.vibe.data.VibeWebSocketListener {
+            override fun onForceLogout(reason: String) { finishLogout() }
+        }
+        webSocket.addListener(listener)
+        onDispose { webSocket.removeListener(listener) }
+    }
     // Определяем стартовый экран на основе авторизации
     val startDestination = if (userPreferences.isLoggedIn) {
         if (userPreferences.passcode != null) Screen.PasscodeAuth.route else Screen.MainContainer.route
@@ -140,13 +162,7 @@ fun VibeNavGraph(
                 onThemeToggle = onThemeToggle,
                 language = language,
                 onLanguageToggle = onLanguageToggle,
-                onLogout = {
-                    com.flasskdev.vibe.MainActivity.isUnlocked = false
-                    userPreferences.logout()
-                    navController.navigate(Screen.Auth.route) {
-                        popUpTo(0) { inclusive = true }
-                    }
-                },
+                onLogout = { finishLogout() },
                 onNavigateToPasscodeSetup = {
                     navController.navigate(Screen.PasscodeSetup.route)
                 },
@@ -220,13 +236,7 @@ fun VibeNavGraph(
                         popUpTo(Screen.PasscodeAuth.route) { inclusive = true }
                     }
                 },
-                onLogout = {
-                    com.flasskdev.vibe.MainActivity.isUnlocked = false
-                    userPreferences.logout()
-                    navController.navigate(Screen.Auth.route) {
-                        popUpTo(0) { inclusive = true }
-                    }
-                }
+                onLogout = { finishLogout() }
             )
         }
         composable(

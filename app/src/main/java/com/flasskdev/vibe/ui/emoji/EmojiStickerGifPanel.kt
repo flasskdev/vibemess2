@@ -146,7 +146,7 @@ object EmojiGridModel {
     /** categoryId -> позиция заголовка в плоском списке (для быстрой перемотки). */
     val headerIndex: Map<String, Int> by lazy(LazyThreadSafetyMode.PUBLICATION) {
         buildMap {
-            entries.forEachIndexed { index, entry ->
+            EmojiGridModel.entries.forEachIndexed { index, entry ->
                 if (entry is GridEntry.Header) put(entry.key.removePrefix("h_"), index)
             }
         }
@@ -225,8 +225,9 @@ private fun EmojiPage(recent: List<String>, callbacks: PanelCallbacks) {
         CategoryStrip(
             hasRecent = recentEntries.isNotEmpty(),
             onPick = { categoryId ->
-                val base = EmojiGridModel.headerIndex[categoryId] ?: 0
-                scope.launch { gridState.scrollToItem(base + offset) }
+                EmojiGridModel.headerIndex[categoryId]?.let { base ->
+                    scope.launch { gridState.animateScrollToItem(base + offset) }
+                }
             },
             onRecent = { scope.launch { gridState.scrollToItem(0) } }
         )
@@ -328,7 +329,7 @@ private fun StickerPage(
     }
 
     val headerPositions = remember(entries) {
-        buildMap { entries.forEachIndexed { i, e -> if (e is GridEntry.Header) put(e.key, i) } }
+        entries.withIndex().filter { it.value is GridEntry.Header }.associate { it.value.key to it.index }
     }
 
     /* Предзагрузка: подтягиваем в кэш Coil стикеры на два экрана вперёд.
@@ -382,7 +383,8 @@ private fun StickerCell(path: String, callbacks: PanelCallbacks) {
     val context = LocalContext.current
     // ImageRequest кэшируется по пути: один и тот же объект между
     // рекомпозициями -> Coil попадает в память-кэш, а не перезапускает загрузку.
-    val request = remember(path) { StickerImageCache.request(context, path) }
+    val animate = VibeEffects.animatedPreviews
+    val request = remember(path, animate) { if (animate) StickerImageCache.request(context, path) else StickerImageCache.request(context, path).newBuilder(context).memoryCacheKey("static-preview:$path").decoderFactory(coil.decode.BitmapFactoryDecoder.Factory()).build() }
 
     Box(
         Modifier
@@ -412,26 +414,55 @@ data class GifUi(val id: String, val previewUrl: String, val fullUrl: String, va
 @Composable
 private fun GifPage(gifs: List<GifUi>, callbacks: PanelCallbacks) {
     val context = LocalContext.current
-    LazyVerticalGrid(
-        columns = GridCells.Fixed(2),
-        modifier = Modifier.fillMaxSize(),
-        contentPadding = PaddingValues(VibeSpacing.sm),
-        horizontalArrangement = Arrangement.spacedBy(VibeSpacing.xs),
-        verticalArrangement = Arrangement.spacedBy(VibeSpacing.xs)
-    ) {
-        items(items = gifs, key = { it.id }, contentType = { "gif" }) { gif ->
-            val request = remember(gif.previewUrl) { StickerImageCache.request(context, gif.previewUrl) }
-            AsyncImage(
-                model = request,
-                contentDescription = null,
-                imageLoader = StickerImageCache.loader(context),
-                contentScale = ContentScale.Crop,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .aspectRatio(gif.aspect.coerceIn(0.6f, 1.8f))
-                    .clip(RoundedCornerShape(VibeRadius.sm))
-                    .clickable { callbacks.onGif(gif.fullUrl) }
-            )
+    val ru = com.flasskdev.vibe.data.UserPreferences(context).language == "RU"
+    var query by rememberSaveable { mutableStateOf("") }
+    var loaded by remember { mutableStateOf(gifs) }
+    var loading by remember { mutableStateOf(false) }
+    var error by remember { mutableStateOf<String?>(null) }
+    var retry by remember { mutableIntStateOf(0) }
+    LaunchedEffect(query, retry, gifs) {
+        if (query.isBlank() && gifs.isNotEmpty()) { loaded = gifs; return@LaunchedEffect }
+        loading = true; error = null
+        try {
+            kotlinx.coroutines.delay(300)
+            val result = com.flasskdev.vibe.data.network.GiphyApi.search(query)
+            loaded = result.distinctBy { it.id }.map {
+                GifUi(it.id, it.previewUrl, it.fullUrl, if (it.height > 0 && it.width > 0) it.width.toFloat() / it.height else 1f)
+            }
+        } catch (e: kotlinx.coroutines.CancellationException) { throw e }
+        catch (e: Exception) { loaded = emptyList(); error = e.message ?: (if (ru) "Не удалось загрузить GIF" else "Could not load GIFs") }
+        finally { loading = false }
+    }
+    Column(Modifier.fillMaxSize()) {
+        androidx.compose.material3.OutlinedTextField(
+            value = query, onValueChange = { query = it }, singleLine = true,
+            label = { Text(if (ru) "Поиск GIF" else "Search GIFs") },
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp)
+        )
+        if (loading) androidx.compose.material3.LinearProgressIndicator(Modifier.fillMaxWidth())
+        if (!loading && loaded.isEmpty()) {
+            Text(error ?: if (ru) "GIF не найдены" else "No GIFs found", Modifier.padding(8.dp))
+            if (error != null) androidx.compose.material3.TextButton(onClick = { retry++ }) { Text(if (ru) "Повторить" else "Retry") }
+        }
+        LazyVerticalGrid(
+            columns = GridCells.Fixed(2), modifier = Modifier.weight(1f),
+            contentPadding = PaddingValues(VibeSpacing.sm),
+            horizontalArrangement = Arrangement.spacedBy(VibeSpacing.xs), verticalArrangement = Arrangement.spacedBy(VibeSpacing.xs)
+        ) {
+            items(items = loaded, key = { it.id }, contentType = { "gif" }) { gif ->
+                val animate = VibeEffects.animatedPreviews
+                val request = remember(gif.previewUrl, animate) {
+                    ImageRequest.Builder(context).data(gif.previewUrl).memoryCacheKey("gif-preview:${gif.previewUrl}:$animate")
+                        .apply { if (!animate) decoderFactory(coil.decode.BitmapFactoryDecoder.Factory()) }
+                        .build()
+                }
+                AsyncImage(
+                    model = request, contentDescription = if (ru) "Отправить GIF" else "Send GIF",
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier.fillMaxWidth().aspectRatio(gif.aspect.coerceIn(0.6f, 1.8f))
+                        .clip(RoundedCornerShape(VibeRadius.sm)).clickable { callbacks.onGif(gif.fullUrl) }
+                )
+            }
         }
     }
 }

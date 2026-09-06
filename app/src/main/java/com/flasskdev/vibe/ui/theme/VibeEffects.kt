@@ -1,7 +1,11 @@
 package com.flasskdev.vibe.ui.theme
 
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.setValue
+import androidx.compose.runtime.mutableStateOf
 import android.os.Build
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.ui.draw.blur
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Shape
 import dev.chrisbanes.haze.HazeState
@@ -28,7 +32,11 @@ import androidx.compose.ui.unit.Dp
 object VibeEffects {
 
     /** Реальный блюр (Haze) в чате. Держите false, если нужен максимальный FPS. */
-    var chatBlurEnabled: Boolean = true
+    var chatBlurEnabled: Boolean by mutableStateOf(true)
+    var liquidEnabled: Boolean by mutableStateOf(true)
+    var glowEnabled: Boolean by mutableStateOf(true)
+    var animatedPreviews: Boolean by mutableStateOf(true)
+    val liquid: Boolean get() = liquidEnabled && blurSupportedByDevice
 
     /** RenderEffect-блюр аппаратно доступен только с Android 12 (API 31). */
     val blurSupportedByDevice: Boolean = Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
@@ -42,7 +50,7 @@ object VibeEffects {
      * чтобы рефракция и дисперсия читались сквозь tint.
      */
     fun chatPanelAlpha(hasLiquid: Boolean = false): Float = when {
-        hasLiquid -> 0.72f
+        hasLiquid && liquid -> 0.72f
         chatBlur -> 0.92f
         else -> 0.97f
     }
@@ -56,7 +64,7 @@ fun Modifier.vibeChatGlassSource(
     liquidState: LiquidState? = null
 ): Modifier {
     var m = this
-    if (liquidState != null && VibeEffects.blurSupportedByDevice) {
+    if (liquidState != null && VibeEffects.liquid) {
         m = m.liquefiable(liquidState)
     }
     if (VibeEffects.chatBlur) {
@@ -87,7 +95,7 @@ fun Modifier.vibeChatGlass(
     frost: Dp = 50.dp
 ): Modifier {
     var m = this
-    if (liquidState != null && VibeEffects.blurSupportedByDevice) {
+    if (liquidState != null && VibeEffects.liquid) {
         m = m.liquid(liquidState) {
             this.shape = shape
             this.refraction = refraction
@@ -105,3 +113,5 @@ fun Modifier.vibeChatGlass(
     }
     return m
 }
+fun Modifier.vibeOptionalBlur(radius: Dp): Modifier =
+    if (VibeEffects.chatBlur && radius.value > 0f) this.then(Modifier.blur(radius)) else this

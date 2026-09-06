@@ -8,6 +8,7 @@ import androidx.compose.animation.core.updateTransition
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -17,6 +18,10 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.ui.graphics.PathOperation
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.HorizontalDivider
@@ -232,7 +237,7 @@ fun VibeContextMenu(
             Box(
                 modifier = Modifier
                     .matchParentSize()
-                    .graphicsLayer { alpha = progress }
+                    .graphicsLayer { alpha = progress.coerceIn(0f, 1f) }
                     .drawWithContent {
                         val targetHighlight = anchor.highlightBounds ?: anchor.bounds
                         val allRects = buildList {
@@ -245,20 +250,11 @@ fun VibeContextMenu(
                         }
 
                         if (allRects.isNotEmpty()) {
-                            val path = Path().apply {
-                                addRect(Rect(0f, 0f, size.width, size.height))
-                                val delta = 2.dp.toPx()
-                                val cr = CornerRadius(anchor.cornerRadius.toPx(), anchor.cornerRadius.toPx())
-                                allRects.forEach { rect ->
-                                    val inflated = Rect(
-                                        rect.left - delta,
-                                        rect.top - delta,
-                                        rect.right + delta,
-                                        rect.bottom + delta
-                                    )
-                                    addRoundRect(RoundRect(rect = inflated, cornerRadius = cr))
-                                }
-                                fillType = PathFillType.EvenOdd
+                            var path = Path().apply { addRect(Rect(0f, 0f, size.width, size.height)) }
+                            val cr = CornerRadius(anchor.cornerRadius.toPx(), anchor.cornerRadius.toPx())
+                            allRects.forEach { rect ->
+                                val cutout = Path().apply { addRoundRect(RoundRect(rect = rect, cornerRadius = cr)) }
+                                path = Path.combine(PathOperation.Difference, path, cutout)
                             }
                             drawPath(path, color = scrimColor)
                         } else {
@@ -275,7 +271,8 @@ fun VibeContextMenu(
             Box(
                 modifier = Modifier
                     .offset { IntOffset(x.roundToInt(), y.roundToInt()) }
-                    .width(menuWidth)
+                    .width(minOf(menuWidth, with(density) { (containerSize.width - 2 * marginPx).coerceAtLeast(1f).toDp() }))
+                    .heightIn(max = with(density) { (containerSize.height - 2 * marginPx).coerceAtLeast(1f).toDp() })
                     .onSizeChanged { menuSize = it }
                     .graphicsLayer {
                         transformOrigin = TransformOrigin(pivotX, pivotY)
@@ -283,7 +280,7 @@ fun VibeContextMenu(
                         val s = 0.86f + 0.14f * progress
                         scaleX = s
                         scaleY = s
-                        alpha = progress
+                        alpha = progress.coerceIn(0f, 1f)
                         // Небольшой сдвиг навстречу якорю усиливает связь с пальцем
                         translationY = (1f - progress) * (if (openUpward) 14f else -14f)
                     }
@@ -319,7 +316,7 @@ fun VibeContextMenu(
                         shape = RoundedCornerShape(PanelCorner)
                     )
             ) {
-                Column(modifier = Modifier.fillMaxWidth()) {
+                Column(modifier = Modifier.fillMaxWidth().verticalScroll(rememberScrollState())) {
                     if (header != null) {
                         header()
                         VibeMenuDivider(inset = 0.dp)

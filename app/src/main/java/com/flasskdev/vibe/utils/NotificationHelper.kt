@@ -42,15 +42,34 @@ object NotificationHelper {
             }
         }
 
+    fun resetForLogout() {
+        activeMessagingStyles.clear()
+        activeChatId = null
+    }
     fun clearNotificationState(senderId: Int) {
         activeMessagingStyles.remove(senderId)
     }
 
+    private fun soundUri(context: Context): android.net.Uri? = when (val sound = com.flasskdev.vibe.data.UserPreferences(context).notificationSound) {
+        "silent" -> null
+        "default" -> android.media.RingtoneManager.getDefaultUri(android.media.RingtoneManager.TYPE_NOTIFICATION)
+        else -> android.net.Uri.parse(sound)
+    }
+    private fun channelId(context: Context): String {
+        val sound = com.flasskdev.vibe.data.UserPreferences(context).notificationSound
+        val digest = java.security.MessageDigest.getInstance("SHA-256").digest(sound.toByteArray()).take(8).joinToString("") { "%02x".format(it) }
+        return "${CHANNEL_ID}_$digest"
+    }
+    private fun suppressed(context: Context, senderId: Int): Boolean {
+        val prefs = com.flasskdev.vibe.data.UserPreferences(context)
+        return !prefs.isLoggedIn || prefs.notificationMuteAll || senderId.toString() in prefs.mutedNotificationPeers
+    }
     fun createNotificationChannel(context: Context) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val importance = NotificationManager.IMPORTANCE_HIGH
-            val channel = NotificationChannel(CHANNEL_ID, CHANNEL_NAME, importance).apply {
+            val channel = NotificationChannel(channelId(context), CHANNEL_NAME, importance).apply {
                 description = "Notifications for new messages"
+                setSound(soundUri(context), android.media.AudioAttributes.Builder().setUsage(android.media.AudioAttributes.USAGE_NOTIFICATION).build())
             }
             val notificationManager: NotificationManager =
                 context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
@@ -59,7 +78,7 @@ object NotificationHelper {
     }
 
     fun showMessageNotification(context: Context, senderName: String, messageContent: String, senderId: Int) {
-        if (senderId == activeChatId) return
+        if (senderId == activeChatId || suppressed(context, senderId)) return
 
         createNotificationChannel(context)
 
@@ -125,7 +144,8 @@ object NotificationHelper {
 
         messagingStyle.addMessage(messageContent, System.currentTimeMillis(), senderPerson)
 
-        val builder = NotificationCompat.Builder(context, CHANNEL_ID)
+        val builder = NotificationCompat.Builder(context, channelId(context))
+            .setSound(soundUri(context))
             .setSmallIcon(R.mipmap.ic_launcher_round)
             .setLargeIcon(bitmap)
             .setStyle(messagingStyle)
@@ -138,12 +158,13 @@ object NotificationHelper {
             .setDeleteIntent(deletePendingIntent)
 
         with(NotificationManagerCompat.from(context)) {
-            notify(senderId, builder.build())
+            try { notify(senderId, builder.build()) } catch (_: SecurityException) {}
         }
     }
 
     fun editMessageNotification(context: Context, senderName: String, messageContent: String, senderId: Int) {
-        if (senderId == activeChatId) return
+        if (senderId == activeChatId || suppressed(context, senderId)) return
+        createNotificationChannel(context)
 
         val existingStyle = activeMessagingStyles[senderId]
         if (existingStyle == null) {
@@ -211,7 +232,8 @@ object NotificationHelper {
             context, senderId, deleteIntent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
-        val builder = NotificationCompat.Builder(context, CHANNEL_ID)
+        val builder = NotificationCompat.Builder(context, channelId(context))
+            .setSound(soundUri(context))
             .setSmallIcon(R.mipmap.ic_launcher_round)
             .setLargeIcon(bitmap)
             .setStyle(newStyle)

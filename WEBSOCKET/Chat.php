@@ -1,5 +1,7 @@
 <?php
 
+require_once __DIR__ . '/VibeSecurity.php';
+
 use Ratchet\MessageComponentInterface;
 use Ratchet\ConnectionInterface;
 
@@ -90,8 +92,13 @@ class Chat implements MessageComponentInterface {
         return null;
     }
 
+    private function isNotificationMuted($userId,$peerId) {
+        $q=$this->getDB()->prepare('SELECT u.id FROM users u WHERE u.id=? AND u.is_banned=0 AND u.is_freezed=0 AND NOT EXISTS (SELECT 1 FROM notification_settings n WHERE n.user_id=u.id AND n.mute_all=1) AND NOT EXISTS (SELECT 1 FROM muted_users m WHERE m.user_id=u.id AND m.muted_id=?)');
+        $q->execute([$userId,$peerId]); return !$q->fetchColumn();
+    }
     private function sendFcmNotification($userId, $senderName, $content, $senderId, $action = 'new') {
-        if (!$this->fcmProjectId) return;
+        (new VibeSecurity($this->getDB()))->registerContact($userId,$senderId);
+        if ($this->isNotificationMuted($userId,$senderId) || !$this->fcmProjectId) return;
 
         try {
             // Check if muted
@@ -117,7 +124,8 @@ class Chat implements MessageComponentInterface {
                             'action' => $action,
                             'sender_name' => $senderName,
                             'content' => $content,
-                            'sender_id' => (string)$senderId
+                            'sender_id' => (string)$senderId,
+                            'receiver_id' => (string)$userId
                         ]
                     ]
                 ];
@@ -159,7 +167,8 @@ class Chat implements MessageComponentInterface {
             $host = defined('RABBITMQ_HOST') ? RABBITMQ_HOST : 'rabbitmq-flasskdev.alwaysdata.net';
             $port = defined('RABBITMQ_PORT') ? RABBITMQ_PORT : 5672;
             $user = defined('RABBITMQ_USER') ? RABBITMQ_USER : 'flasskdev';
-            $pass = defined('RABBITMQ_PASS') ? RABBITMQ_PASS : '31052019RoG+';
+            $pass = defined('RABBITMQ_PASS') ? RABBITMQ_PASS : getenv('RABBITMQ_PASS');
+            if (!$pass) throw new RuntimeException('RABBITMQ_PASS is not configured');
             $vhost = defined('RABBITMQ_VHOST') ? RABBITMQ_VHOST : 'flasskdev_mobile';
 
             $connection = new \PhpAmqpLib\Connection\AMQPStreamConnection($host, $port, $user, $pass, $vhost);
@@ -447,7 +456,13 @@ class Chat implements MessageComponentInterface {
     }
 
     private function sendToUser($userId, $data) {
+        if (($data['type']??'')==='chat_message' && (int)($data['receiver_id']??0)===(int)$userId) {
+            (new VibeSecurity($this->getDB()))->registerContact($userId,(int)$data['sender_id']);
+            $data['suppress_notification']=$this->isNotificationMuted($userId,(int)$data['sender_id']);
+        }
         if (isset($this->userConnections[$userId])) {
+            $conn=$this->userConnections[$userId];
+            if (!(new VibeSecurity($this->getDB()))->validate($conn->vibeSessionToken??'', $userId)) { $this->rejectSession($conn); return false; }
             $this->userConnections[$userId]->send(json_encode($data));
             return true;
         }
@@ -781,11 +796,54 @@ class Chat implements MessageComponentInterface {
         echo "[+] Новое соединение ({$conn->resourceId}) IP: {$conn->realIp}\n";
     }
 
+    private function rejectSession($conn) {
+        $conn->send(json_encode(['type'=>'force_logout','reason'=>'session_invalid']));
+        $conn->close();
+    }
+    private $lastSessionSweep = 0;
+    private function sweepSessions() {
+        if (time() === $this->lastSessionSweep) return;
+        $this->lastSessionSweep = time();
+        $security = new VibeSecurity($this->getDB());
+        foreach ($this->clients as $conn) {
+            if (isset($conn->vibeUserId) && !$security->validate($conn->vibeSessionToken ?? '', $conn->vibeUserId)) {
+                $this->rejectSession($conn);
+            }
+        }
+    }
     public function onMessage(ConnectionInterface $from, $msg) {
         $this->checkGlobalFreezes();
         try {
             $data = json_decode($msg, true);
-            if (!$data) return;
+            if (!is_array($data) || !is_string($data['type'] ?? null)) return;
+            $security = new VibeSecurity($this->getDB());
+            $type = $data['type'];
+            if ($type === 'verify_two_factor') {
+                $from->send(json_encode($security->challenge($data))); return;
+            }
+            $public = ['auth_connect','check_availability','register','login','verify_code'];
+            if (!in_array($type, $public, true)) {
+                $session = $security->validate($from->vibeSessionToken ?? '', $from->vibeUserId ?? 0);
+                if (!$session) { $this->rejectSession($from); return; }
+                $uid = (int)$session['user_id'];
+                // User identity comes from the authenticated connection, never the frame.
+                $data['user_id'] = $uid;
+                if (in_array($type,['send_message','typing','stop_typing'],true)) $data['sender_id']=$uid;
+                if ($type==='logout') {
+                    $this->getDB()->prepare('DELETE FROM auth_sessions WHERE token_hash=?')->execute([hash('sha256',$from->vibeSessionToken)]);
+                    $this->getDB()->prepare('DELETE FROM device_tokens WHERE user_id=? AND token=?')->execute([$uid,$from->vibeFcmToken??'']);
+                    $this->rejectSession($from); return;
+                }
+                if ($type==='session_ping') { $from->send(json_encode(['type'=>'session_pong'])); return; }
+                if ($type==='get_two_factor' || $type==='set_two_factor') {
+                    $from->send(json_encode($security->settings($uid,$data,$from->vibeSessionToken))); return;
+                }
+                if ($type==='get_notification_settings' || $type==='set_notification_settings') {
+                    $from->send(json_encode($security->notifications($uid,$data))); return;
+                }
+                // Bot responses must use the separately authenticated bot HTTP API.
+                if (in_array($type,['answer_callback_query','bot_callback_answer'],true)) return;
+            }
 
         // ==========================================
         // 0. АУТЕНТИФИКАЦИЯ СОЕДИНЕНИЯ
@@ -796,12 +854,19 @@ class Chat implements MessageComponentInterface {
             $deviceId = $data['device_id'] ?? null;
             $deviceName = $data['device_name'] ?? 'Unknown Device';
             $osVersion = $data['os_version'] ?? 'Unknown OS';
+            if (isset($from->vibeUserId) && (int)$from->vibeUserId !== $userId) { $this->rejectSession($from); return; }
+            $token = $data['session_token'] ?? '';
+            if (!$security->validate($token,$userId,$deviceId)) { $this->rejectSession($from); return; }
+            $from->vibeSessionToken=$token;
+            $from->vibeFcmToken=$fcmToken;
+
 
             if ($userId > 0) {
                 // Check if user is banned or freezed
                 $stmtCheck = $this->getDB()->prepare("SELECT is_banned, is_freezed FROM users WHERE id = ?");
                 $stmtCheck->execute([$userId]);
                 $userStatus = $stmtCheck->fetch();
+                if (!$userStatus) { $this->rejectSession($from); return; }
                 if ($userStatus && ((int)$userStatus['is_banned'] === 1 || (int)$userStatus['is_freezed'] === 1)) {
                     $reason = ((int)$userStatus['is_banned'] === 1) ? 'banned' : 'freezed';
                     $from->send(json_encode([
@@ -963,6 +1028,7 @@ class Chat implements MessageComponentInterface {
             $targetDeviceId = $data['device_id'] ?? '';
             if ($userId > 0 && !empty($targetDeviceId)) {
                 try {
+                    $this->getDB()->prepare('DELETE FROM auth_sessions WHERE user_id=? AND device_id=?')->execute([$userId,$targetDeviceId]);
                     $stmt = $this->getDB()->prepare("DELETE FROM sessions WHERE user_id = ? AND device_id = ?");
                     $stmt->execute([$userId, $targetDeviceId]);
 
@@ -1211,6 +1277,9 @@ class Chat implements MessageComponentInterface {
         // 3. ВЕРИФИКАЦИЯ КОДА И СОЗДАНИЕ ПОЛЬЗОВАТЕЛЯ
         // ==========================================
         if (isset($data['type']) && $data['type'] == 'verify_code') {
+            if (!is_string($data['device_id']??null) || strlen($data['device_id'])<8 || strlen($data['device_id'])>255) {
+                $from->send(json_encode(['type'=>'verify_code_result','success'=>false,'message'=>'Обновите приложение перед входом.'])); return;
+            }
             $email = trim($data['email'] ?? '');
             $code = trim($data['code'] ?? '');
             
@@ -1247,8 +1316,8 @@ class Chat implements MessageComponentInterface {
                         if ($existingUser) {
                             $userId = (int)$existingUser['id'];
                         } else {
-                            $insertStmt = $this->getDB()->prepare("INSERT INTO users (email, username) VALUES (?, ?)");
-                            $insertStmt->execute([$row['email'], $row['username']]);
+                            $insertStmt = $this->getDB()->prepare("INSERT INTO users (email, username, name, freeze_time, spamblock_time) VALUES (?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)");
+                            $insertStmt->execute([$row['email'], $row['username'], $row['username']]);
                             $userId = (int)$this->getDB()->lastInsertId();
                             
                             // Страховка: если lastInsertId вернул 0 (баг MariaDB/PDO)
@@ -1270,21 +1339,8 @@ class Chat implements MessageComponentInterface {
                         $del = $this->getDB()->prepare("DELETE FROM pending_users WHERE email = ?");
                         $del->execute([$email]);
 
-                        // Автоматически привязываем WebSocket-соединение к пользователю
-                        if ($userId > 0) {
-                            $this->userConnections[$userId] = $from;
-                            $from->vibeUserId = $userId;
-
-                            $onlineStmt = $this->getDB()->prepare("UPDATE users SET is_online = 1 WHERE id = ?");
-                            $onlineStmt->execute([$userId]);
-                        }
-                        
-                        $from->send(json_encode([
-                            'type' => 'verify_code_result',
-                            'success' => true,
-                            'user_id' => $userId,
-                            'is_new_user' => $isNewUser
-                        ]));
+                        $result=$security->afterEmail($userId,$data['device_id']??'', $isNewUser);
+                        $from->send(json_encode($result));
                     } else {
                         $attempts = (int)($row['attempts'] ?? 0) + 1;
                         if ($attempts >= 5) {
@@ -1316,7 +1372,7 @@ class Chat implements MessageComponentInterface {
                 $from->send(json_encode([
                     'type' => 'verify_code_result',
                     'success' => false,
-                    'message' => 'Ошибка базы данных: ' . $e->getMessage()
+                    'message' => 'Сервер временно недоступен. Попробуйте позже.'
                 ]));
             }
             return;
@@ -1444,13 +1500,8 @@ class Chat implements MessageComponentInterface {
             }
 
             try {
-                // Определяем тип отправителя
                 $senderType = 'user';
-                $botCheck = $this->getDB()->prepare("SELECT id FROM bots WHERE id = ?");
-                $botCheck->execute([$senderId]);
-                if ($botCheck->fetch()) {
-                    $senderType = 'bot';
-                }
+                $this->getDB()->prepare('INSERT IGNORE INTO notification_contacts (user_id,peer_id) VALUES (?,?)')->execute([$senderId,$receiverId]);
 
                 // Проверка spamblock
                 $spamCheckStmt = $this->getDB()->prepare("SELECT is_spamblock, spamblock_time FROM users WHERE id = ?");
@@ -1632,8 +1683,9 @@ class Chat implements MessageComponentInterface {
             if ($messageId <= 0 || $content === '') return;
 
             try {
-                $stmt = $this->getDB()->prepare("UPDATE messages SET content = ?, is_edited = 1 WHERE id = ?");
-                $stmt->execute([$content, $messageId]);
+                $stmt = $this->getDB()->prepare("UPDATE messages SET content = ?, is_edited = 1 WHERE id = ? AND sender_id = ? AND sender_type = 'user'");
+                $stmt->execute([$content, $messageId, $from->vibeUserId]);
+                if ($stmt->rowCount() === 0) return;
 
                 $stmt2 = $this->getDB()->prepare("SELECT sender_id, receiver_id FROM messages WHERE id = ?");
                 $stmt2->execute([$messageId]);
@@ -3149,6 +3201,8 @@ class Chat implements MessageComponentInterface {
 
     public function checkNewMessages() {
         if ($this->getDB() === null) return;
+        try { $this->sweepSessions(); }
+        catch (\Throwable $e) { error_log('[AUTH] Session sweep unavailable'); return; }
         
         $this->checkNewChatActions();
         $this->checkNewBotCallbackAnswers();
@@ -3204,7 +3258,7 @@ class Chat implements MessageComponentInterface {
                 ];
                 
                 if (isset($this->userConnections[$receiverId])) {
-                    $this->userConnections[$receiverId]->send(json_encode($messagePayload, JSON_UNESCAPED_UNICODE));
+                    $this->sendToUser($receiverId,$messagePayload);
                 }
                 
                 $chatListUpdates = $this->buildChatList($receiverId, $senderId);

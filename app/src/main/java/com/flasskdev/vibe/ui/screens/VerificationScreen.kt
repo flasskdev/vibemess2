@@ -22,6 +22,8 @@ import kotlinx.coroutines.launch
 
 @Composable
 fun VerificationScreen(email: String, webSocket: VibeWebSocket, onVerified: (Int, Boolean) -> Unit) {
+    var challenge by remember { mutableStateOf<String?>(null) }
+    var hint by remember { mutableStateOf<String?>(null) }
     var otpCode by remember { mutableStateOf("") }
     var errorMessage by remember { mutableStateOf<String?>(null) }
     var isLoading by remember { mutableStateOf(false) }
@@ -34,7 +36,15 @@ fun VerificationScreen(email: String, webSocket: VibeWebSocket, onVerified: (Int
                 scope.launch {
                     if (message.type == "verify_code_result") {
                         isLoading = false
-                        if (message.success == true) {
+                        if (message.requires_two_factor) {
+                            challenge = message.challenge_token
+                            hint = message.hint
+                            errorMessage = null
+                        } else if (message.challenge_expired) {
+                            challenge = null
+                            otpCode = ""
+                            errorMessage = message.message
+                        } else if (message.success == true) {
                             val userId = message.user_id ?: 0
                             val isNewUser = message.is_new_user == true
                             onVerified(userId, isNewUser)
@@ -58,13 +68,24 @@ fun VerificationScreen(email: String, webSocket: VibeWebSocket, onVerified: (Int
         }
     }
 
-    DisposableEffect(webSocket) {
+    DisposableEffect(webSocket, listener) {
         webSocket.addListener(listener)
         onDispose {
             webSocket.removeListener(listener)
         }
     }
 
+    if (challenge != null) {
+        com.flasskdev.vibe.ui.auth.TwoFactorChallengeScreen(
+            hint = hint, attemptsLeft = null, isLoading = isLoading, errorMessage = errorMessage,
+            onSubmit = { password ->
+                challenge?.let { token -> isLoading = true; errorMessage = null; webSocket.verifyTwoFactor(token, password) }
+            },
+            onForgot = { errorMessage = "Сброс второго фактора по одному коду из почты недоступен." },
+            onBack = { challenge = null; otpCode = ""; errorMessage = null }
+        )
+        return
+    }
     Box(modifier = Modifier.fillMaxSize()) {
         VibeBackgroundMesh()
 

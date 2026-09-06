@@ -18,6 +18,7 @@ import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.outlined.PushPin
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.ui.input.pointer.pointerInput
+import com.flasskdev.vibe.ui.theme.vibeOptionalBlur
 import androidx.compose.ui.draw.blur
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.combinedClickable
@@ -478,17 +479,17 @@ fun ChatScreen(
         var isHeaderMenuOpen by remember { mutableStateOf(false) }
 
         val headerBlur by animateDpAsState(
-            targetValue = if (messageMenuOpen.value || isAttachMenuOpen) 18.dp else 0.dp,
+            targetValue = 0.dp,
             animationSpec = tween(180),
             label = "headerBlur"
         )
         val messageListBlur by animateDpAsState(
-            targetValue = if (isAttachMenuOpen || isHeaderMenuOpen) 18.dp else 0.dp,
+            targetValue = 0.dp,
             animationSpec = tween(180),
             label = "messageListBlur"
         )
         val inputBarBlur by animateDpAsState(
-            targetValue = if (isHeaderMenuOpen) 18.dp else 0.dp,
+            targetValue = 0.dp,
             animationSpec = tween(180),
             label = "inputBarBlur"
         )
@@ -499,7 +500,7 @@ fun ChatScreen(
                 modifier = Modifier
                     .align(Alignment.TopCenter)
                     .zIndex(10f)
-                    .blur(headerBlur),
+                    .vibeOptionalBlur(headerBlur),
                 viewModel = viewModel,
                 strings = strings,
                 hazeState = hazeState,
@@ -520,7 +521,7 @@ fun ChatScreen(
 
             ChatMessageList(
                 // Список не пересчитывается под клавиатуру, а сдвигается на фазе draw.
-                modifier = Modifier.chatImeSlide().blur(messageListBlur),
+                modifier = Modifier.chatImeSlide().vibeOptionalBlur(messageListBlur),
                 viewModel = viewModel,
                 strings = strings,
                 listState = listState,
@@ -588,7 +589,7 @@ fun ChatScreen(
                         translationY = layoutState.bottomBarHeightPx * bottomBarShift
                         alpha = 1f - bottomBarShift
                     }
-                    .blur(inputBarBlur),
+                    .vibeOptionalBlur(inputBarBlur),
                 viewModel = viewModel,
                 webSocket = webSocket,
                 strings = strings,
@@ -1378,7 +1379,7 @@ fun MessageBubble(
 
     val isTarget = showMenu || (isAnyMessageMenuOpen && isSelected)
     val targetScale by animateFloatAsState(
-        targetValue = if (isTarget) 1.03f else 1f,
+        targetValue = 1f,
         animationSpec = spring(dampingRatio = 0.74f, stiffness = Spring.StiffnessMedium),
         label = "bubbleMenuScale"
     )
@@ -1388,7 +1389,7 @@ fun MessageBubble(
         label = "bubbleMenuElevation"
     )
     val bubbleBlur by animateDpAsState(
-        targetValue = if (isAnyMessageMenuOpen && !isTarget) 16.dp else 0.dp,
+        targetValue = 0.dp,
         animationSpec = tween(180),
         label = "bubbleBlur"
     )
@@ -1431,7 +1432,7 @@ fun MessageBubble(
     Row(
         modifier = modifier
             .fillMaxWidth()
-            .blur(bubbleBlur)
+            .vibeOptionalBlur(bubbleBlur)
             .graphicsLayer { translationX = swipeX.value * density },
 
         horizontalArrangement = if (isMine) Arrangement.End else Arrangement.Start

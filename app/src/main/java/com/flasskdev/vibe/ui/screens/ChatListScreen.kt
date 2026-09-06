@@ -15,6 +15,7 @@ import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.shrinkHorizontally
 import android.os.Build
+import com.flasskdev.vibe.ui.theme.vibeOptionalBlur
 import androidx.compose.ui.draw.blur
 import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.geometry.CornerRadius
@@ -627,7 +628,7 @@ fun ChatListScreen(
     var menuOpen by remember { mutableStateOf(false) }
     val chatMenuAnchor = rememberVibeMenuAnchor()
     val bgBlur by animateDpAsState(
-        targetValue = if (menuOpen) 18.dp else 0.dp,
+        targetValue = 0.dp,
         animationSpec = tween(180),
         label = "chatListBgBlur"
     )
@@ -880,7 +881,7 @@ fun ChatListScreen(
                             // «садится» в позицию инлайн-строки, а не в центр.
                             transformOrigin = TransformOrigin(0f, 1f)
                         }
-                        .blur(bgBlur)
+                        .vibeOptionalBlur(bgBlur)
                         .padding(horizontal = PageInset)
                 ) {
                     Spacer(modifier = Modifier.height(6.dp))
@@ -919,7 +920,7 @@ fun ChatListScreen(
 
             // Search field with Cancel
             item(key = "search_field") {
-                Box(modifier = Modifier.fillMaxWidth().blur(bgBlur)) {
+                Box(modifier = Modifier.fillMaxWidth().vibeOptionalBlur(bgBlur)) {
                     IOSSearchField(
                         query = searchQuery,
                         onQueryChange = { searchQuery = it },
@@ -932,7 +933,7 @@ fun ChatListScreen(
             // Segmented control: All / Unread
             if (chats.isNotEmpty()) {
                 item(key = "segmented_filter") {
-                    Box(modifier = Modifier.fillMaxWidth().blur(bgBlur)) {
+                    Box(modifier = Modifier.fillMaxWidth().vibeOptionalBlur(bgBlur)) {
                         IOSSegmentedControl(
                             selected = filter,
                             onSelect = { filter = it },
@@ -987,7 +988,7 @@ fun ChatListScreen(
 
             // Pinned card
             if (pinnedChats.isNotEmpty()) {
-                item(key = "header_pinned") { Box(Modifier.blur(bgBlur)) { GroupHeader(title = strings.chatsSectionPinned) } }
+                item(key = "header_pinned") { Box(Modifier.vibeOptionalBlur(bgBlur)) { GroupHeader(title = strings.chatsSectionPinned) } }
                 itemsIndexed(
                     pinnedChats,
                     key = { _, item -> "pinned_" + item.chat.interlocutorId }
@@ -997,12 +998,12 @@ fun ChatListScreen(
                     }
                     val isTarget = menuOpen && menuTarget?.chat?.interlocutorId == chatWithUser.chat.interlocutorId
                     val itemBlur by animateDpAsState(
-                        targetValue = if (menuOpen && !isTarget) 18.dp else 0.dp,
+                        targetValue = 0.dp,
                         animationSpec = tween(180),
                         label = "pinnedItemBlur"
                     )
                     val itemScale by animateFloatAsState(
-                        targetValue = if (isTarget) 1.025f else 1f,
+                        targetValue = 1f,
                         animationSpec = spring(dampingRatio = 0.72f, stiffness = Spring.StiffnessMedium),
                         label = "pinnedItemScale"
                     )
@@ -1018,7 +1019,7 @@ fun ChatListScreen(
                                     clip = false
                                 }
                             }
-                            .blur(itemBlur)
+                            .vibeOptionalBlur(itemBlur)
                             .notificationEntrance(
                                 entrance = entrance,
                                 chatId = chatWithUser.chat.interlocutorId,
@@ -1050,7 +1051,7 @@ fun ChatListScreen(
             // Main card
             if (regularChats.isNotEmpty()) {
                 item(key = "header_all") {
-                    Box(Modifier.blur(bgBlur)) {
+                    Box(Modifier.vibeOptionalBlur(bgBlur)) {
                         GroupHeader(
                             title = if (filter == ChatFilter.UNREAD) strings.filterUnread
                             else strings.chatsSectionAll
@@ -1066,12 +1067,12 @@ fun ChatListScreen(
                     }
                     val isTarget = menuOpen && menuTarget?.chat?.interlocutorId == chatWithUser.chat.interlocutorId
                     val itemBlur by animateDpAsState(
-                        targetValue = if (menuOpen && !isTarget) 18.dp else 0.dp,
+                        targetValue = 0.dp,
                         animationSpec = tween(180),
                         label = "regularItemBlur"
                     )
                     val itemScale by animateFloatAsState(
-                        targetValue = if (isTarget) 1.025f else 1f,
+                        targetValue = 1f,
                         animationSpec = spring(dampingRatio = 0.72f, stiffness = Spring.StiffnessMedium),
                         label = "regularItemScale"
                     )
@@ -1087,7 +1088,7 @@ fun ChatListScreen(
                                     clip = false
                                 }
                             }
-                            .blur(itemBlur)
+                            .vibeOptionalBlur(itemBlur)
                             .notificationEntrance(
                                 entrance = entrance,
                                 chatId = chatWithUser.chat.interlocutorId,
@@ -1114,7 +1115,7 @@ fun ChatListScreen(
                         }
                     )
                 }
-                item(key = "footer_count") { Box(Modifier.blur(bgBlur)) { GroupFooter(text = strings.chatsCountFooter(chats.size)) } }
+                item(key = "footer_count") { Box(Modifier.vibeOptionalBlur(bgBlur)) { GroupFooter(text = strings.chatsCountFooter(chats.size)) } }
             }
 
             // Global search card
@@ -1152,7 +1153,7 @@ fun ChatListScreen(
                     // крупный заголовок уже почти растворился.
                     alpha = InlineBarFadeEasing.transform(collapseProgress)
                 }
-                .blur(bgBlur)
+                .vibeOptionalBlur(bgBlur)
         ) {
             Column(
                 modifier = Modifier
@@ -1292,11 +1293,11 @@ private fun IOSSearchField(
                 .weight(1f)
                 .height(38.dp)
                 .clip(RoundedCornerShape(10.dp))
-                .liquid(liquidState) {
+                .then(if (com.flasskdev.vibe.ui.theme.VibeEffects.liquid) Modifier.liquid(liquidState) {
                     refraction = 0.2f
                     curve = 0.2f
                     edge = 0.08f
-                }
+                } else Modifier)
                 .background(IOSFill.copy(alpha = if (isDarkSurface()) 0.20f else 0.10f))
                 .onFocusChanged { focused = it.isFocused },
             decorationBox = { innerTextField ->
@@ -1830,7 +1831,8 @@ fun ChatItemView(
                 Column(modifier = Modifier.weight(1f)) {
 
                     // Title line: name, mute glyph, badges, timestamp
-                    Row(verticalAlignment = Alignment.CenterVertically) {
+                    Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                        Row(modifier = Modifier.weight(1f), verticalAlignment = Alignment.CenterVertically) {
                         Text(
                             text = name,
                             fontSize = 17.sp,
@@ -1862,7 +1864,7 @@ fun ChatItemView(
                             badgeSize = 15.dp
                         )
 
-                        Spacer(modifier = Modifier.weight(1f))
+                        }
 
                         Text(
                             text = timeFormatted,

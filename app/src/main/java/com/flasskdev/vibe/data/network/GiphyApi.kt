@@ -95,16 +95,16 @@ object GiphyApi {
     }
 
     private suspend fun request(url: String): List<GifItem> = withContext(Dispatchers.IO) {
-        if (apiKey.isBlank()) return@withContext emptyList()
+        if (apiKey.isBlank()) throw java.io.IOException("GIPHY_API_KEY не настроен в сборке приложения")
         try {
             val req = Request.Builder().url(url).get().build()
             client.newCall(req).execute().use { resp ->
-                if (!resp.isSuccessful) return@withContext emptyList()
+                if (!resp.isSuccessful) throw java.io.IOException("GIPHY HTTP ${resp.code}")
                 val body = resp.body?.string() ?: return@withContext emptyList()
                 parse(body)
             }
-        } catch (e: Exception) {
-            emptyList()
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
         }
     }
 
@@ -116,17 +116,12 @@ object GiphyApi {
             val obj = data.optJSONObject(i) ?: continue
             val images = obj.optJSONObject("images") ?: continue
 
-            // Preview: small animated version for the grid.
-            val preview = images.optJSONObject("fixed_width_downsampled")
-                ?: images.optJSONObject("fixed_width")
-                ?: images.optJSONObject("preview_gif")
-            // Full: what we actually send. Prefer a size-capped version, fall back to original.
-            val full = images.optJSONObject("downsized_medium")
-                ?: images.optJSONObject("downsized")
-                ?: images.optJSONObject("original")
-
+            fun rendition(vararg names: String): JSONObject? = names.asSequence()
+                .mapNotNull { images.optJSONObject(it) }
+                .firstOrNull { it.optString("url").startsWith("https://") }
+            val preview = rendition("fixed_width_downsampled", "fixed_width", "preview_gif", "original")
+            val fullObj = rendition("downsized_medium", "downsized", "original", "fixed_width") ?: preview
             val previewUrl = preview?.optString("url").orEmpty()
-            val fullObj = full ?: preview
             val fullUrl = fullObj?.optString("url").orEmpty()
             if (previewUrl.isBlank() || fullUrl.isBlank()) continue
 

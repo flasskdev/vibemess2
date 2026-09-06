@@ -17,6 +17,8 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.setValue
+import kotlinx.coroutines.launch
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
@@ -38,6 +40,8 @@ import java.util.Locale
 
 @Composable
 fun MainSettingsContent(
+    webSocket: com.flasskdev.vibe.data.VibeWebSocket,
+    onNavigateExtra: (String) -> Unit,
     onNavigateToPrivacy: () -> Unit,
     onNavigateToAccount: () -> Unit,
     onNavigateToDevices: () -> Unit,
@@ -47,6 +51,20 @@ fun MainSettingsContent(
     val db = remember { com.flasskdev.vibe.data.local.AppDatabase.getDatabase(context) }
     val userPrefs = remember { com.flasskdev.vibe.data.UserPreferences(context) }
     val user by db.chatDao().getUserById(userPrefs.userId).collectAsState(initial = null)
+    var liveAvatar by androidx.compose.runtime.remember { androidx.compose.runtime.mutableStateOf<String?>(null) }
+    var liveName by androidx.compose.runtime.remember { androidx.compose.runtime.mutableStateOf<String?>(null) }
+    val scope = androidx.compose.runtime.rememberCoroutineScope()
+    androidx.compose.runtime.DisposableEffect(webSocket, userPrefs.userId) {
+        val listener = object : com.flasskdev.vibe.data.VibeWebSocketListener {
+            override fun onUserInfo(userId: Int, isOnline: Boolean, lastSeen: Long?, isDeveloper: Boolean, isVerified: Boolean, registerDate: Long?, isBot: Boolean, about: String?, username: String?, name: String?, avatarUrl: String?, lastSeenStatus: String?, canMessage: Boolean, isBanned: Boolean, isFreezed: Boolean, isBlockedByMe: Boolean, isBlockedByUser: Boolean) {
+                if (userId == userPrefs.userId) scope.launch { liveAvatar = avatarUrl.orEmpty(); liveName = name }
+            }
+            override fun onAvatarUploaded(userId: Int, avatarUrl: String) { if (userId == userPrefs.userId) scope.launch { liveAvatar = avatarUrl } }
+        }
+        webSocket.addListener(listener); webSocket.getUserInfo(userPrefs.userId)
+        onDispose { webSocket.removeListener(listener) }
+    }
+    val avatar = liveAvatar ?: user?.avatarUrl
     val strings = com.flasskdev.vibe.ui.theme.LocalVibeStrings.current
 
     // Version is read from the package instead of a hardcoded literal, so a release
@@ -97,7 +115,7 @@ fun MainSettingsContent(
                             .padding(horizontal = 14.dp, vertical = 14.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        val displayName = user?.name?.takeIf { it.isNotBlank() } ?: strings.userLabel
+                        val displayName = (liveName ?: user?.name)?.takeIf { it.isNotBlank() } ?: strings.userLabel
                         Box(
                             modifier = Modifier
                                 .size(56.dp)
@@ -109,10 +127,10 @@ fun MainSettingsContent(
                                 ),
                             contentAlignment = Alignment.Center
                         ) {
-                            if (!user?.avatarUrl.isNullOrEmpty()) {
+                            if (!avatar.isNullOrBlank()) {
                                 AsyncImage(
                                     model = ImageRequest.Builder(context)
-                                        .data(user?.avatarUrl)
+                                        .data(avatar?.let { if (it.startsWith("/")) "https://flasskdev.alwaysdata.net$it" else it })
                                         .crossfade(true)
                                         .build(),
                                     contentDescription = strings.a11yAvatar,
@@ -185,7 +203,7 @@ fun MainSettingsContent(
                             title = strings.settingsNotifications,
                             subtitle = strings.settingsNotificationsSubtitle,
                             iconTint = Color(0xFFF44336),
-                            soonLabel = strings.settingsSoonBadge
+                            onClick = { onNavigateExtra("notifications") }
                         )
                         VibeSettingsRowDivider()
                         VibeSettingsRow(
@@ -193,7 +211,7 @@ fun MainSettingsContent(
                             title = strings.settingsPowerSaving,
                             subtitle = strings.settingsPowerSavingSubtitle,
                             iconTint = Color(0xFFCDDC39),
-                            soonLabel = strings.settingsSoonBadge
+                            onClick = { onNavigateExtra("power_saving") }
                         )
                         VibeSettingsRowDivider()
                         VibeSettingsRow(
@@ -209,7 +227,7 @@ fun MainSettingsContent(
                             title = strings.btnLanguage,
                             subtitle = strings.languageName,
                             iconTint = Color(0xFF9C27B0),
-                            soonLabel = strings.settingsSoonBadge
+                            onClick = { onNavigateExtra("language") }
                         )
                     }
                 }

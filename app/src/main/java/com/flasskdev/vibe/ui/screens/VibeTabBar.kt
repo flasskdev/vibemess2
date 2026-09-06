@@ -97,7 +97,7 @@ private val BarShape = RoundedCornerShape(30.dp)
 
 /** liquid() умеет работать только там, где есть RenderEffect (API 31+). */
 private fun Modifier.vibeTabGlass(state: LiquidState?): Modifier =
-    if (state != null && VibeEffects.blurSupportedByDevice) {
+    if (state != null && VibeEffects.liquid) {
         this.liquid(state) {
             refraction = 0.34f
             curve = 0.42f
@@ -115,7 +115,7 @@ fun VibeTabBar(
     modifier: Modifier = Modifier
 ) {
     val isDark = MaterialTheme.colorScheme.background.luminanceIsDark()
-    val glassActive = liquidState != null && VibeEffects.blurSupportedByDevice
+    val glassActive = liquidState != null && VibeEffects.liquid
 
     // Со стеклом фон может быть лёгким, без стекла — обязан быть плотным.
     val tintTop = if (isDark) {

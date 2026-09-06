@@ -307,10 +307,13 @@ fun SettingsScreen(
             val privacySelectField = PrivacyField.bySelectRoute(screen)
 
             when {
+                screen == "notifications" -> NotificationSettingsContent(userPreferences, webSocket) { onCurrentScreenChange(ROUTE_MAIN) }
+                screen == "power_saving" -> PowerSavingSettingsContent(userPreferences) { onCurrentScreenChange(ROUTE_MAIN) }
+                screen == "language" -> LanguageSettingsContent(userPreferences) { onCurrentScreenChange(ROUTE_MAIN) }
                 screen == ROUTE_PRIVACY -> PrivacySettingsContent(
                     onBack = { onCurrentScreenChange(ROUTE_MAIN) },
                     blockedCount = blockedCount,
-                    twoFactorEnabled = userPreferences.twoFactorPassword != null,
+                    twoFactorEnabled = userPreferences.twoFactorEnabled,
                     passcodeEnabled = userPreferences.passcode != null,
                     onNavigateToBlockedUsers = { onCurrentScreenChange(ROUTE_BLOCKED) },
                     onNavigateToTwoFactor = { onCurrentScreenChange(ROUTE_TWO_FACTOR) },
@@ -327,8 +330,9 @@ fun SettingsScreen(
                     onBack = { onCurrentScreenChange(ROUTE_PRIVACY) }
                 )
 
-                screen == ROUTE_TWO_FACTOR -> TwoFactorSettingsContent(
-                    userPreferences = userPreferences,
+                screen == ROUTE_TWO_FACTOR -> ServerTwoFactorSettingsContent(
+                    prefs = userPreferences,
+                    ws = webSocket,
                     onBack = { onCurrentScreenChange(ROUTE_PRIVACY) }
                 )
 
@@ -419,6 +423,8 @@ fun SettingsScreen(
 
                 // ROUTE_MAIN and anything unknown: never leave a blank screen.
                 else -> MainSettingsContent(
+                    webSocket = webSocket,
+                    onNavigateExtra = onCurrentScreenChange,
                     onNavigateToPrivacy = {
                         webSocket.getBlockedCount(userPreferences.userId)
                         onCurrentScreenChange(ROUTE_PRIVACY)

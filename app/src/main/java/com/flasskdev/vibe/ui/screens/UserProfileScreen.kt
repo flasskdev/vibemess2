@@ -1,5 +1,7 @@
 package com.flasskdev.vibe.ui.screens
 
+import com.flasskdev.vibe.ui.components.vibeMenuAnchor
+
 import android.net.Uri
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -636,86 +638,21 @@ private fun ProfileContent(
 
                 if (!isCurrentUser && user?.isBot != true) {
                     var showMenu by remember { mutableStateOf(false) }
-                    Box {
-                        BarIconButton(
-                            icon = Icons.Rounded.MoreVert,
-                            contentDescription = strings.a11yProfileMenu,
-                            onClick = { showMenu = true }
-                        )
-                        DropdownMenu(
-                            expanded = showMenu,
-                            onDismissRequest = { showMenu = false },
-                            shape = RoundedCornerShape(14.dp),
-                            containerColor = MaterialTheme.colorScheme.surface
-                        ) {
-                            DropdownMenuItem(
-                                text = {
-                                    Text(
-                                        text = strings.profileCopyUsername,
-                                        fontSize = 15.sp,
-                                        color = MaterialTheme.colorScheme.onSurface
-                                    )
-                                },
-                                onClick = {
-                                    showMenu = false
-                                    onCopyUsername()
-                                },
-                                leadingIcon = {
-                                    Icon(
-                                        imageVector = Icons.Rounded.ContentCopy,
-                                        contentDescription = null,
-                                        tint = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.55f),
-                                        modifier = Modifier.size(20.dp)
-                                    )
-                                }
-                            )
-                            if (isBlockedByMe) {
-                                DropdownMenuItem(
-                                    text = {
-                                        Text(
-                                            text = strings.chatUnblockUser,
-                                            fontSize = 15.sp,
-                                            color = MaterialTheme.colorScheme.onSurface
-                                        )
-                                    },
-                                    onClick = {
-                                        showMenu = false
-                                        onUnblock()
-                                    },
-                                    leadingIcon = {
-                                        Icon(
-                                            imageVector = Icons.Outlined.LockOpen,
-                                            contentDescription = null,
-                                            tint = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.55f),
-                                            modifier = Modifier.size(20.dp)
-                                        )
-                                    }
-                                )
-                            } else {
-                                DropdownMenuItem(
-                                    text = {
-                                        Text(
-                                            text = strings.chatBlockUser,
-                                            fontSize = 15.sp,
-                                            color = VibeError
-                                        )
-                                    },
-                                    onClick = {
-                                        showMenu = false
-                                        onBlock()
-                                    },
-                                    leadingIcon = {
-                                        Icon(
-                                            imageVector = Icons.Outlined.Block,
-                                            contentDescription = null,
-                                            tint = VibeError,
-                                            modifier = Modifier.size(20.dp)
-                                        )
-                                    }
-                                )
-                            }
-                        }
+                    val menuAnchor = com.flasskdev.vibe.ui.components.rememberVibeMenuAnchor()
+                    Box(Modifier.vibeMenuAnchor(menuAnchor)) {
+                        BarIconButton(icon = Icons.Rounded.MoreVert, contentDescription = strings.a11yProfileMenu, onClick = { showMenu = true })
                     }
+                    com.flasskdev.vibe.ui.components.VibeContextMenu(
+                        expanded = showMenu, anchor = menuAnchor, onDismiss = { showMenu = false },
+                        actions = listOf(
+                            com.flasskdev.vibe.ui.components.VibeMenuAction(label = strings.profileCopyUsername, icon = Icons.Rounded.ContentCopy, onClick = onCopyUsername),
+                            com.flasskdev.vibe.ui.components.VibeMenuAction(
+                                label = if (isBlockedByMe) strings.chatUnblockUser else strings.chatBlockUser,
+                                icon = if (isBlockedByMe) Icons.Outlined.LockOpen else Icons.Outlined.Block,
+                                destructive = !isBlockedByMe, onClick = { if (isBlockedByMe) onUnblock() else onBlock() }
+                            )
+                        )
+                    )
                 } else {
                     Spacer(Modifier.size(44.dp))
                 }

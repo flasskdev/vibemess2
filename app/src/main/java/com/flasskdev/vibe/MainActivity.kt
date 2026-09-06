@@ -68,7 +68,7 @@ class MainActivity : ComponentActivity() {
 
         webSocket.connect()
         FirebaseMessaging.getInstance().token.addOnSuccessListener { token ->
-            Log.d("VibeFCM", "FCM Token: $token")
+            Log.d("VibeFCM", "FCM registration token available")
             webSocket.authConnect(userPreferences.userId, token, userPreferences.deviceId, userPreferences.deviceName)
         }.addOnFailureListener {
             Log.e("VibeFCM", "Failed to get FCM token", it)
@@ -129,6 +129,7 @@ class MainActivity : ComponentActivity() {
         Coil.setImageLoader(imageLoader)
 
         userPreferences = UserPreferences(this)
+        webSocket.configure(userPreferences)
 
         // PERF: прогрев процесса. Room, шрифты, assets стикеров, кэш метаданных аудио
         // и дисковый кэш Coil инициализируются ЛЕНИВО — раньше это происходило ровно в
@@ -145,6 +146,32 @@ class MainActivity : ComponentActivity() {
         setContent {
             var isDarkTheme by remember { mutableStateOf(userPreferences.isDarkTheme) }
             var currentLanguage by remember { mutableStateOf(userPreferences.language) }
+            DisposableEffect(userPreferences) {
+                fun updateEffects(level: Int?) {
+                    val saving = com.flasskdev.vibe.data.PowerSavingPolicy.active(userPreferences.powerSaving, userPreferences.powerAutomatic, level, userPreferences.powerThreshold)
+                    com.flasskdev.vibe.ui.theme.VibeEffects.liquidEnabled = !(saving && userPreferences.powerDisableLiquid)
+                    com.flasskdev.vibe.ui.theme.VibeEffects.chatBlurEnabled = !(saving && userPreferences.powerDisableBlur)
+                    com.flasskdev.vibe.ui.theme.VibeEffects.glowEnabled = !(saving && userPreferences.powerDisableGlow)
+                    com.flasskdev.vibe.ui.theme.VibeEffects.animatedPreviews = !(saving && userPreferences.powerDisablePreviews)
+                }
+                var batteryLevel: Int? = null
+                val receiver = object : android.content.BroadcastReceiver() {
+                    override fun onReceive(context: android.content.Context, intent: android.content.Intent) {
+                        val level = intent.getIntExtra(android.os.BatteryManager.EXTRA_LEVEL, -1)
+                        val scale = intent.getIntExtra(android.os.BatteryManager.EXTRA_SCALE, -1)
+                        batteryLevel = if (level >= 0 && scale > 0) (level * 100 / scale).coerceIn(0, 100) else null
+                        updateEffects(batteryLevel)
+                    }
+                }
+                val listener = android.content.SharedPreferences.OnSharedPreferenceChangeListener { _, _ ->
+                    currentLanguage = userPreferences.language
+                    updateEffects(batteryLevel)
+                }
+                userPreferences.observe(listener)
+                ContextCompat.registerReceiver(this@MainActivity, receiver, android.content.IntentFilter(android.content.Intent.ACTION_BATTERY_CHANGED), ContextCompat.RECEIVER_NOT_EXPORTED)
+                updateEffects(batteryLevel)
+                onDispose { userPreferences.unobserve(listener); unregisterReceiver(receiver) }
+            }
             val currentStrings = if (currentLanguage == "RU") com.flasskdev.vibe.ui.theme.ruStrings else com.flasskdev.vibe.ui.theme.enStrings
 
             androidx.compose.runtime.CompositionLocalProvider(
@@ -175,7 +202,7 @@ class MainActivity : ComponentActivity() {
                             Box(
                                 modifier = Modifier
                                     .fillMaxSize()
-                                    .then(if (showExpandedPlayer) Modifier.haze(hazeState) else Modifier)
+                                    .then(if (showExpandedPlayer && com.flasskdev.vibe.ui.theme.VibeEffects.chatBlur) Modifier.haze(hazeState) else Modifier)
                             ) {
                                 VibeNavGraph(
                                     navController = navController,

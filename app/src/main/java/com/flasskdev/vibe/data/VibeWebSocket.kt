@@ -15,6 +15,11 @@ import java.util.concurrent.atomic.AtomicBoolean
 @Serializable
 data class VibeMessage(
     val type: String,
+    val session_token: String? = null,
+    val challenge_token: String? = null,
+    val requires_two_factor: Boolean = false,
+    val challenge_expired: Boolean = false,
+    val hint: String? = null,
     val email: String? = null,
     val username: String? = null,
     val code: String? = null,
@@ -156,6 +161,7 @@ data class ReactionUserDetail(
 
 interface VibeWebSocketListener {
     fun onAuthResponse(message: VibeMessage) {}
+    fun onSettingsResponse(message: JSONObject) {}
     fun onChatMessage(senderId: Int, receiverId: Int, senderType: String, content: String, timestamp: String, messageId: Int, senderName: String, replyToId: Int?, replyToContent: String?, replyToSenderName: String?, forwardedFromId: Int?, forwardedFromName: String?, isEdited: Boolean = false, attachments: List<String>? = null, replyMarkup: com.flasskdev.vibe.data.local.ReplyMarkup? = null) {}
     fun onChatListUpdate(chats: List<ChatInfo>) {}
     fun onMessagesLoaded(withUserId: Int, messages: List<MessageInfo>, offset: Int) {}
@@ -200,6 +206,30 @@ interface VibeWebSocketListener {
 }
 
 class VibeWebSocket {
+    private var preferences: UserPreferences? = null
+    @Volatile private var authenticated = false
+    private var lastAuth: VibeMessage? = null
+    private var heartbeat: Job? = null
+    fun configure(preferences: UserPreferences) { this.preferences = preferences }
+    private val publicTypes = setOf("auth_connect", "register", "login", "check_availability", "verify_code", "verify_two_factor")
+    private fun flushPending() {
+        val typed = synchronized(pendingMessages) { pendingMessages.toList().also { pendingMessages.clear() } }
+        typed.forEach(::sendJson)
+        val raw = synchronized(pendingRawMessages) { pendingRawMessages.toList().also { pendingRawMessages.clear() } }
+        raw.forEach(::sendRawJson)
+    }
+    fun verifyTwoFactor(challenge: String, password: String) {
+        sendRawJson(JSONObject().put("type", "verify_two_factor").put("challenge_token", challenge).put("password", password).toString())
+    }
+    fun logout() {
+        com.flasskdev.vibe.utils.NotificationHelper.resetForLogout()
+        if (authenticated) webSocket?.send("{\"type\":\"logout\"}")
+        disconnect()
+        lastAuth = null
+        preferences?.logout()
+        synchronized(pendingMessages) { pendingMessages.clear() }
+        synchronized(pendingRawMessages) { pendingRawMessages.clear() }
+    }
     private val client = OkHttpClient.Builder()
         .readTimeout(0, TimeUnit.MILLISECONDS)
         .pingInterval(30, TimeUnit.SECONDS)
@@ -238,7 +268,7 @@ class VibeWebSocket {
     }
 
     fun connect() {
-        if (isConnecting) return
+        if (isConnecting || isConnected) return
         isConnecting = true
 
         // Recreate scope if it was cancelled
@@ -258,21 +288,11 @@ class VibeWebSocket {
                 _isActuallyConnected.set(true)
                 isConnecting = false
                 reconnectJob?.cancel()
+                authenticated = false
+                lastAuth?.let { sendJson(it) }
                 listeners.forEach { it.onConnected() }
+                flushPending()
 
-                val pending = synchronized(pendingMessages) {
-                    val list = pendingMessages.toList()
-                    pendingMessages.clear()
-                    list
-                }
-                pending.forEach(::sendJson)
-
-                val rawPending = synchronized(pendingRawMessages) {
-                    val list = pendingRawMessages.toList()
-                    pendingRawMessages.clear()
-                    list
-                }
-                rawPending.forEach(::sendRawJson)
             }
 
             override fun onMessage(ws: WebSocket, text: String) {
@@ -283,9 +303,49 @@ class VibeWebSocket {
                     val obj = JSONObject(text)
                     val type = obj.optString("type", "")
 
+                    if (type == "verify_code_result" && obj.optBoolean("success")) {
+                        val token = obj.optString("session_token")
+                        if (token.isBlank()) throw IllegalStateException("Server update required")
+                        preferences?.sessionToken = token
+                    }
                     when (type) {
+                        "auth_connect_result" -> {
+                            if (obj.optBoolean("success")) {
+                                authenticated = true
+                                heartbeat?.cancel()
+                                heartbeat = scope.launch {
+                                    while (isActive && authenticated) { delay(15_000); sendRawJson("{\"type\":\"session_ping\"}") }
+                                }
+                                flushPending()
+                                preferences?.let {
+                                    getUserInfo(it.userId)
+                                    sendRawJson("{\"type\":\"get_notification_settings\"}")
+                                }
+                            }
+                        }
+                        "session_pong" -> Unit
+                        "notification_settings_result" -> {
+                            if (obj.optBoolean("success")) preferences?.let {
+                                it.notificationMuteAll = obj.optBoolean("mute_all")
+                                it.autoMuteNewChats = obj.optBoolean("auto_mute_new")
+                            }
+                            listeners.forEach { it.onSettingsResponse(obj) }
+                        }
+                        "two_factor_result" -> {
+                            if (obj.optBoolean("success")) preferences?.let {
+                                it.twoFactorEnabled = obj.optBoolean("enabled")
+                                it.twoFactorHint = obj.optString("hint").takeUnless { h -> h == "null" || h.isBlank() }
+                                it.twoFactorPassword = null
+                            }
+                            listeners.forEach { it.onSettingsResponse(obj) }
+                        }
                         "chat_message" -> {
                             val senderId = obj.optInt("sender_id", 0)
+                            preferences?.let { prefs ->
+                                if (obj.optInt("receiver_id") == prefs.userId) {
+                                    prefs.mutedNotificationPeers = if (obj.optBoolean("suppress_notification")) prefs.mutedNotificationPeers + senderId.toString() else prefs.mutedNotificationPeers - senderId.toString()
+                                }
+                            }
                             val receiverId = obj.optInt("receiver_id", 0)
                             val senderType = obj.optString("sender_type", "user")
                             val content = obj.optString("content", "")
@@ -500,6 +560,7 @@ class VibeWebSocket {
                         }
                         "force_logout" -> {
                             val reason = obj.optString("reason", "")
+                            logout()
                             listeners.forEach { it.onForceLogout(reason) }
                         }
 
@@ -810,6 +871,8 @@ class VibeWebSocket {
     }
 
     private fun handleDisconnect() {
+        authenticated = false
+        heartbeat?.cancel()
         _isActuallyConnected.set(false)
         isConnecting = false
         webSocket = null
@@ -823,14 +886,17 @@ class VibeWebSocket {
 
     fun authConnect(userId: Int, fcmToken: String? = null, deviceId: String, deviceName: String) {
         val osVersion = "Android ${android.os.Build.VERSION.RELEASE}"
-        sendJson(VibeMessage(
+        val auth = VibeMessage(
+            session_token = preferences?.sessionToken,
             type = "auth_connect", 
             user_id = userId, 
             fcm_token = fcmToken,
             device_id = deviceId,
             device_name = deviceName,
             os_version = osVersion
-        ))
+        )
+        lastAuth = auth
+        sendJson(auth)
     }
 
     fun getSessions(userId: Int) {
@@ -854,7 +920,7 @@ class VibeWebSocket {
     }
 
     fun verifyCode(email: String, code: String) {
-        sendJson(VibeMessage(type = "verify_code", email = email, code = code))
+        sendJson(VibeMessage(type = "verify_code", email = email, code = code, device_id = preferences?.deviceId))
     }
 
     fun setNickname(email: String, nickname: String, userId: Int? = null) {
@@ -981,7 +1047,12 @@ class VibeWebSocket {
         sendJson(msg)
     }
 
-    private    fun sendJson(message: VibeMessage) {
+    private fun sendJson(message: VibeMessage) {
+        if (message.type == "auth_connect" && !isConnected) { connect(); return }
+        if (message.type !in publicTypes && !authenticated) {
+            synchronized(pendingMessages) { if (pendingMessages.size < 100) pendingMessages.add(message) }
+            connect(); return
+        }
         try {
             val text = json.encodeToString(message)
             // Keep diagnostics metadata-only; message bodies must not reach logcat.
@@ -1000,6 +1071,11 @@ class VibeWebSocket {
 
     fun sendRawJson(jsonString: String) {
         try {
+            val type = JSONObject(jsonString).optString("type")
+            if (type !in publicTypes && !authenticated) {
+                synchronized(pendingRawMessages) { if (pendingRawMessages.size < 100) pendingRawMessages.add(jsonString) }
+                connect(); return
+            }
             // Raw commands include callbacks and administration requests. Queue them across reconnects
             // just like typed protocol messages so a tap is not silently lost while the socket reconnects.
             Log.d(TAG, "OUTGOING raw command")
@@ -1127,11 +1203,14 @@ class VibeWebSocket {
     }
 
     fun disconnect() {
+        authenticated = false
+        heartbeat?.cancel()
         _isActuallyConnected.set(false)
         isConnecting = false
         reconnectJob?.cancel()
         scopeJob.cancel()
-        webSocket?.close(1000, "App closing")
+        val old = webSocket
         webSocket = null
+        old?.close(1000, "App closing")
     }
 }

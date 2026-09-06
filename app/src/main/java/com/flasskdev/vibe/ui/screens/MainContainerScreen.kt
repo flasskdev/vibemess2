@@ -167,28 +167,6 @@ fun MainContainerScreen(
     val context = androidx.compose.ui.platform.LocalContext.current
     val strings = com.flasskdev.vibe.ui.theme.LocalVibeStrings.current
 
-    DisposableEffect(webSocket) {
-        val listener = object : com.flasskdev.vibe.data.VibeWebSocketListener {
-            override fun onForceLogout(reason: String) {
-                scope.launch {
-                    if (reason == "banned") {
-                        logoutToastMessage = strings.accountBannedMessage
-                        showLogoutToast = true
-                    } else if (reason == "freezed") {
-                        logoutToastMessage = strings.accountFrozenMessage
-                        showLogoutToast = true
-                    }
-                    if (showLogoutToast) {
-                        kotlinx.coroutines.delay(3000)
-                    }
-                    userPreferences.logout()
-                    onLogout()
-                }
-            }
-        }
-        webSocket.addListener(listener)
-        onDispose { webSocket.removeListener(listener) }
-    }
 
     Box(
         modifier = Modifier
@@ -217,7 +195,7 @@ fun MainContainerScreen(
                 Box(
                     modifier = Modifier
                         .fillMaxSize()
-                        .liquefiable(tabLiquidState)
+                        .then(if (com.flasskdev.vibe.ui.theme.VibeEffects.liquid) Modifier.liquefiable(tabLiquidState) else Modifier)
                 ) {
                     when (tab) {
                         MainTab.CHATS -> ChatListScreen(
