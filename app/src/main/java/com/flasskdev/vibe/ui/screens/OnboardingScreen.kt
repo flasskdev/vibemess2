@@ -10,6 +10,8 @@ import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.*
@@ -32,21 +34,28 @@ import com.flasskdev.vibe.ui.components.*
 import com.flasskdev.vibe.ui.theme.*
 import kotlinx.coroutines.launch
 import kotlin.math.absoluteValue
+import androidx.compose.material.icons.outlined.Lock
+import androidx.compose.material.icons.outlined.FlashOn
+import androidx.compose.material.icons.outlined.Psychology
+import androidx.compose.material.icons.outlined.Language
+import androidx.compose.material.icons.outlined.Science
+import androidx.compose.material.icons.outlined.AutoAwesome
+import androidx.compose.ui.graphics.vector.ImageVector
 
 data class OnboardingPage(
     val title: String,
     val description: String,
-    val icon: String
+    val icon: ImageVector
 )
 
-val onboardingIcons = listOf("🔒", "⚡", "🧠", "🌐", "🧪")
+val onboardingIcons = listOf(Icons.Outlined.Lock, Icons.Outlined.FlashOn, Icons.Outlined.Psychology, Icons.Outlined.Language, Icons.Outlined.Science)
 
 @Composable
 fun OnboardingScreen(onFinished: () -> Unit) {
     val strings = com.flasskdev.vibe.ui.theme.LocalVibeStrings.current
     val onboardingPages = remember(strings) {
         strings.onboardingPages.mapIndexed { index, pair ->
-            OnboardingPage(pair.first, pair.second, onboardingIcons.getOrElse(index) { "✨" })
+            OnboardingPage(pair.first, pair.second, onboardingIcons.getOrElse(index) { Icons.Outlined.AutoAwesome })
         }
     }
 
@@ -210,14 +219,17 @@ fun OnboardingScreen(onFinished: () -> Unit) {
                                     )
                             )
 
-                            Text(
-                                text = page.icon,
-                                fontSize = 100.sp,
-                                modifier = Modifier.graphicsLayer {
-                                    // Parallax: the glyph trails behind its tile while swiping
-                                    translationX = -pageOffset * 150f
-                                    rotationZ = pageOffset * 10f
-                                }
+                            Icon(
+                                imageVector = page.icon,
+                                contentDescription = null,
+                                tint = VibePrimary,
+                                modifier = Modifier
+                                    .size(96.dp)
+                                    .graphicsLayer {
+                                        // Parallax: the glyph trails behind its tile while swiping
+                                        translationX = -pageOffset * 150f
+                                        rotationZ = pageOffset * 10f
+                                    }
                             )
                         }
                     }
